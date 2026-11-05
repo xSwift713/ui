@@ -3160,7 +3160,7 @@ end
 
 WindUI.Strings = {
 	CloseTitle = "Close Script",
-	CloseContent = "Are you sure you want to close this script? If you close it, you will need to run the script again to open it back up.",
+	CloseContent = "Are you sure you want to close this script? If you close it, you will need to execute the script again to open it back up.",
 	Cancel = "Cancel",
 	Close = "Close",
 	Hidden = "界面已隐藏",
