@@ -3159,10 +3159,10 @@ function WindUI.ParseKey(k)
 end
 
 WindUI.Strings = {
-	CloseTitle = "关闭窗口",
-	CloseContent = "确定要关闭窗口吗? 关闭后需要重新执行脚本才能再次打开。",
-	Cancel = "取消",
-	Close = "关闭",
+	CloseTitle = "Close Script",
+	CloseContent = "Are you sure you want to close this script? If you close it, you will need to run the script again to open it back up.",
+	Cancel = "Cancel",
+	Close = "Close",
 	Hidden = "界面已隐藏",
 	Reopen = "按 %s 重新打开",
 	Search = "搜索...",
