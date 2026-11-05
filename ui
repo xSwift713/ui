@@ -1,0 +1,5039 @@
+
+local cloneref = cloneref or function(o) return o end
+local function GetService(name)
+	return cloneref(game:GetService(name))
+end
+
+local Players = GetService("Players")
+local RunService = GetService("RunService")
+local UserInputService = GetService("UserInputService")
+local TweenService = GetService("TweenService")
+local HttpService = GetService("HttpService")
+local Lighting = GetService("Lighting")
+local LocalPlayer = Players.LocalPlayer
+
+local GuiService
+pcall(function() GuiService = GetService("GuiService") end)
+
+local WindUI = {
+	Version = "1.0.0",
+	Name = "LiquidGlass",
+	Themes = {},
+	ThemeOrder = {},
+	Theme = nil,
+	CurrentThemeName = "Dark",
+	Windows = {},
+	Window = nil,
+	Options = {},
+	Transparency = 0.5,
+	Acrylic = false,
+	NotificationLower = false,
+	Font = "BuilderSans",
+	Connections = {},
+	Unloaded = false,
+}
+
+--------------------------------------------------------------------------
+-- 基础工具
+--------------------------------------------------------------------------
+local function Connect(signal, fn)
+	local c = signal:Connect(fn)
+	table.insert(WindUI.Connections, c)
+	return c
+end
+
+local function SafeCall(fn, ...)
+	if type(fn) ~= "function" then return end
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		warn("[LiquidGlass] callback error: " .. tostring(err))
+	end
+	return ok, err
+end
+
+local function Find(list, value)
+	for i, v in ipairs(list) do
+		if v == value then return i end
+	end
+	return nil
+end
+
+local function Clamp01(x)
+	if x < 0 then return 0 elseif x > 1 then return 1 end
+	return x
+end
+
+local function ToColor(c, fallback)
+	if typeof(c) == "Color3" then return c end
+	if type(c) == "string" then
+		local ok, col = pcall(Color3.fromHex, c)
+		if ok and col then return col end
+	end
+	return fallback
+end
+
+local function GetInset()
+	if GuiService then
+		local ok, a = pcall(function() return GuiService:GetGuiInset() end)
+		if ok and typeof(a) == "Vector2" then return a end
+	end
+	return Vector2.new(0, 0)
+end
+
+local function MousePos()
+	local ok, m = pcall(function() return UserInputService:GetMouseLocation() end)
+	if not ok or typeof(m) ~= "Vector2" then return Vector2.new(0, 0) end
+	return m - GetInset()
+end
+
+local function IsTouch()
+	local ok, t = pcall(function()
+		return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	end)
+	return ok and t or false
+end
+
+local function IsClick(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local FontCache = {}
+local function GetFont(weight)
+	weight = weight or "Medium"
+	local key = WindUI.Font .. "/" .. weight
+	if FontCache[key] ~= nil then return FontCache[key] or nil end
+	local ok, f = pcall(function()
+		local w = Enum.FontWeight[weight]
+		if WindUI.Font:find("rbxasset") then
+			return Font.new(WindUI.Font, w)
+		end
+		return Font.fromName(WindUI.Font, w)
+	end)
+	if not ok or not f then
+		ok, f = pcall(function()
+			return Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight[weight])
+		end)
+	end
+	FontCache[key] = (ok and f) or false
+	return FontCache[key] or nil
+end
+
+--------------------------------------------------------------------------
+-- 弹簧动画引擎 (液态感的核心: 带回弹的连续运动, 可随时改目标不打断速度)
+--------------------------------------------------------------------------
+local Springs = {}
+local SpringHooks = {}
+
+local function Pack(v)
+	local t = typeof(v)
+	if t == "number" then return { v }, t
+	elseif t == "UDim2" then return { v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset }, t
+	elseif t == "Color3" then return { v.R, v.G, v.B }, t
+	elseif t == "Vector2" then return { v.X, v.Y }, t
+	elseif t == "UDim" then return { v.Scale, v.Offset }, t
+	end
+	return nil, t
+end
+
+local function Unpack(a, t)
+	if t == "number" then return a[1]
+	elseif t == "UDim2" then return UDim2.new(a[1], a[2], a[3], a[4])
+	elseif t == "Color3" then return Color3.new(Clamp01(a[1]), Clamp01(a[2]), Clamp01(a[3]))
+	elseif t == "Vector2" then return Vector2.new(a[1], a[2])
+	elseif t == "UDim" then return UDim.new(a[1], a[2])
+	end
+end
+
+local function SetProp(obj, prop, value)
+	obj[prop] = value
+end
+
+-- freq: 振动频率 (越大越快), damp: 阻尼比 (<1 回弹, 1 无回弹)
+local function Spring(obj, props, freq, damp)
+	if obj == nil then return end
+	freq = freq or 4
+	damp = damp or 1
+	local states = Springs[obj]
+	for prop, goal in pairs(props) do
+		local g, t = Pack(goal)
+		if not g then
+			if states then states[prop] = nil end
+			obj[prop] = goal
+		else
+			if not states then
+				states = {}
+				Springs[obj] = states
+			end
+			local st = states[prop]
+			if not st or st.t ~= t then
+				local cur = Pack(obj[prop])
+				st = { x = cur or g, v = {}, t = t }
+				for i = 1, #g do st.v[i] = 0 end
+				states[prop] = st
+			end
+			st.g = g
+			st.f = freq
+			st.d = damp
+		end
+	end
+end
+
+-- 立即设置 (同时取消这些属性上的弹簧)
+local function Set(obj, props)
+	local states = Springs[obj]
+	for prop, v in pairs(props) do
+		if states then states[prop] = nil end
+		obj[prop] = v
+	end
+end
+
+local function StepSprings(dt)
+	if dt > 0.05 then dt = 0.05 end
+	for obj, states in pairs(Springs) do
+		for prop, st in pairs(states) do
+			local w = 6.283185 * st.f
+			local k, c = w * w, 2 * st.d * w
+			-- 子步长保证 w*h <= 0.5, 高频弹簧也不会数值发散
+			local n = math.max(1, math.ceil(dt * 240), math.ceil(dt * w * 2))
+			local h = dt / n
+			local x, v, g = st.x, st.v, st.g
+			local done = true
+			for i = 1, #g do
+				local xi, vi, gi = x[i], v[i], g[i]
+				for _ = 1, n do
+					vi = vi + (-k * (xi - gi) - c * vi) * h
+					xi = xi + vi * h
+				end
+				if math.abs(xi - gi) > 1e-3 or math.abs(vi) > 1e-2 then
+					done = false
+				end
+				x[i], v[i] = xi, vi
+			end
+			local value
+			if done then
+				value = Unpack(g, st.t)
+				states[prop] = nil
+			else
+				value = Unpack(x, st.t)
+			end
+			if not pcall(SetProp, obj, prop, value) then
+				states[prop] = nil
+			end
+		end
+		local hook = SpringHooks[obj]
+		if hook then hook(obj) end
+		if next(states) == nil then
+			Springs[obj] = nil
+		end
+	end
+end
+
+local function Tween(obj, info, props)
+	local states = Springs[obj]
+	if states then
+		for p in pairs(props) do states[p] = nil end
+	end
+	if type(info) == "number" then
+		info = TweenInfo.new(info, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	end
+	local tw = TweenService:Create(obj, info, props)
+	tw:Play()
+	return tw
+end
+
+--------------------------------------------------------------------------
+-- 主题绑定 (属性 -> 主题键 / 函数), 切换主题时全部平滑过渡
+--------------------------------------------------------------------------
+local Bindings = {}
+local ThemeListeners = {}
+
+local function Resolve(key, theme)
+	theme = theme or WindUI.Theme
+	if type(key) == "function" then return key(theme) end
+	return theme[key]
+end
+
+local function Bind(inst, map)
+	local b = Bindings[inst]
+	if not b then
+		b = {}
+		Bindings[inst] = b
+	end
+	for prop, key in pairs(map) do
+		b[prop] = key
+		local v = Resolve(key)
+		if v ~= nil then
+			if Springs[inst] then Springs[inst][prop] = nil end
+			inst[prop] = v
+		end
+	end
+end
+
+-- 让已绑定的属性弹向当前解析值 (用于 hover / 选中 / 主题变化)
+local function Restyle(inst, freq, damp)
+	local b = Bindings[inst]
+	if not b then return end
+	local goals = {}
+	for prop, key in pairs(b) do
+		local v = Resolve(key)
+		if v ~= nil then
+			if Pack(v) then
+				goals[prop] = v
+			else
+				Set(inst, { [prop] = v })
+			end
+		end
+	end
+	Spring(inst, goals, freq or 5, damp or 1)
+end
+
+local function ApplyTheme(instant)
+	for inst in pairs(Bindings) do
+		local alive = true
+		if typeof(inst) == "Instance" then
+			alive = inst.Parent ~= nil
+		end
+		if not alive then
+			Bindings[inst] = nil
+		elseif instant then
+			for prop, key in pairs(Bindings[inst]) do
+				local v = Resolve(key)
+				if v ~= nil then Set(inst, { [prop] = v }) end
+			end
+		else
+			Restyle(inst, 1.8, 1)
+		end
+	end
+	for _, fn in ipairs(ThemeListeners) do
+		task.spawn(SafeCall, fn, WindUI.CurrentThemeName)
+	end
+end
+
+--------------------------------------------------------------------------
+-- 实例构造
+--------------------------------------------------------------------------
+local function Create(class, props, children)
+	local inst = Instance.new(class)
+	local parent, theme
+	if props then
+		for k, v in pairs(props) do
+			if k == "Parent" then
+				parent = v
+			elseif k == "Theme" then
+				theme = v
+			elseif k == "Font" and type(v) == "string" then
+				local f = GetFont(v)
+				if f then inst.FontFace = f end
+			else
+				inst[k] = v
+			end
+		end
+	end
+	if theme then Bind(inst, theme) end
+	if children then
+		for _, c in ipairs(children) do c.Parent = inst end
+	end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function Corner(r, parent)
+	return Create("UICorner", { CornerRadius = typeof(r) == "UDim" and r or UDim.new(0, r or 10), Parent = parent })
+end
+
+local function Padding(t, b, l, r, parent)
+	return Create("UIPadding", {
+		PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+		PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
+		Parent = parent,
+	})
+end
+
+local function List(parent, pad, horizontal, props)
+	local p = {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, pad or 0),
+		FillDirection = horizontal and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+		Parent = parent,
+	}
+	if props then for k, v in pairs(props) do p[k] = v end end
+	return Create("UIListLayout", p)
+end
+
+local function NS(points)
+	local kps = {}
+	for _, p in ipairs(points) do
+		table.insert(kps, NumberSequenceKeypoint.new(p[1], p[2]))
+	end
+	return NumberSequence.new(kps)
+end
+
+local function CS(points)
+	local kps = {}
+	for _, p in ipairs(points) do
+		table.insert(kps, ColorSequenceKeypoint.new(p[1], p[2]))
+	end
+	return ColorSequence.new(kps)
+end
+
+local function AccentSequence(theme)
+	theme = theme or WindUI.Theme
+	return CS({ { 0, theme.Accent }, { 1, theme.Accent2 } })
+end
+
+--------------------------------------------------------------------------
+-- 图标 (Lucide, 支持 "home" / "lucide-home" / "rbxassetid://..." / 数字 id)
+--------------------------------------------------------------------------
+local IconMap ={["accessibility"]=10709751939,["activity"]=10709752035,["air-vent"]=10709752131,["airplay"]=10709752254,["alarm-check"]=10709752405,["alarm-clock"]=10709752630,["alarm-clock-off"]=10709752508,["alarm-minus"]=10709752732,["alarm-plus"]=10709752825,["album"]=10709752906,["alert-circle"]=10709752996,["alert-octagon"]=10709753064,["alert-triangle"]=10709753149,["align-center"]=10709753570,["align-center-horizontal"]=10709753272,["align-center-vertical"]=10709753421,["align-end-horizontal"]=10709753692,["align-end-vertical"]=10709753808,["align-horizontal-distribute-center"]=10747779791,["align-horizontal-distribute-end"]=10747784534,["align-horizontal-distribute-start"]=10709754118,["align-horizontal-justify-center"]=10709754204,["align-horizontal-justify-end"]=10709754317,["align-horizontal-justify-start"]=10709754436,["align-horizontal-space-around"]=10709754590,["align-horizontal-space-between"]=10709754749,["align-justify"]=10709759610,["align-left"]=10709759764,["align-right"]=10709759895,["align-start-horizontal"]=10709760051,["align-start-vertical"]=10709760244,["align-vertical-distribute-center"]=10709760351,["align-vertical-distribute-end"]=10709760434,["align-vertical-distribute-start"]=10709760612,["align-vertical-justify-center"]=10709760814,["align-vertical-justify-end"]=10709761003,["align-vertical-justify-start"]=10709761176,["align-vertical-space-around"]=10709761324,["align-vertical-space-between"]=10709761434,["anchor"]=10709761530,["angry"]=10709761629,["annoyed"]=10709761722,["aperture"]=10709761813,["apple"]=10709761889,["archive"]=10709762233,["archive-restore"]=10709762058,["armchair"]=10709762327,["arrow-big-down"]=10747796644,["arrow-big-left"]=10709762574,["arrow-big-right"]=10709762727,["arrow-big-up"]=10709762879,["arrow-down"]=10709767827,["arrow-down-circle"]=10709763034,["arrow-down-left"]=10709767656,["arrow-down-right"]=10709767750,["arrow-left"]=10709768114,["arrow-left-circle"]=10709767936,["arrow-left-right"]=10709768019,["arrow-right"]=10709768347,["arrow-right-circle"]=10709768226,["arrow-up"]=10709768939,["arrow-up-circle"]=10709768432,["arrow-up-down"]=10709768538,["arrow-up-left"]=10709768661,["arrow-up-right"]=10709768787,["asterisk"]=10709769095,["at-sign"]=10709769286,["award"]=10709769406,["axe"]=10709769508,["axis-3d"]=10709769598,["baby"]=10709769732,["backpack"]=10709769841,["baggage-claim"]=10709769935,["banana"]=10709770005,["banknote"]=10709770178,["bar-chart"]=10709773755,["bar-chart-2"]=10709770317,["bar-chart-3"]=10709770431,["bar-chart-4"]=10709770560,["bar-chart-horizontal"]=10709773669,["barcode"]=10747360675,["baseline"]=10709773863,["bath"]=10709773963,["battery"]=10709774640,["battery-charging"]=10709774068,["battery-full"]=10709774206,["battery-low"]=10709774370,["battery-medium"]=10709774513,["beaker"]=10709774756,["bed"]=10709775036,["bed-double"]=10709774864,["bed-single"]=10709774968,["beer"]=10709775167,["bell"]=10709775704,["bell-minus"]=10709775241,["bell-off"]=10709775320,["bell-plus"]=10709775448,["bell-ring"]=10709775560,["bike"]=10709775894,["binary"]=10709776050,["bitcoin"]=10709776126,["bluetooth"]=10709776655,["bluetooth-connected"]=10709776240,["bluetooth-off"]=10709776344,["bluetooth-searching"]=10709776501,["bold"]=10747813908,["bomb"]=10709781460,["bone"]=10709781605,["book"]=10709781824,["book-open"]=10709781717,["bookmark"]=10709782154,["bookmark-minus"]=10709781919,["bookmark-plus"]=10709782044,["bot"]=10709782230,["box"]=10709782497,["box-select"]=10709782342,["boxes"]=10709782582,["briefcase"]=10709782662,["brush"]=10709782758,["bug"]=10709782845,["building"]=10709783051,["building-2"]=10709782939,["bus"]=10709783137,["cake"]=10709783217,["calculator"]=10709783311,["calendar"]=10709789505,["calendar-check"]=10709783474,["calendar-check-2"]=10709783392,["calendar-clock"]=10709783577,["calendar-days"]=10709783673,["calendar-heart"]=10709783835,["calendar-minus"]=10709783959,["calendar-off"]=10709788784,["calendar-plus"]=10709788937,["calendar-range"]=10709789053,["calendar-search"]=10709789200,["calendar-x"]=10709789407,["calendar-x-2"]=10709789329,["camera"]=10709789686,["camera-off"]=10747822677,["car"]=10709789810,["carrot"]=10709789960,["cast"]=10709790097,["charge"]=10709790202,["check"]=10709790644,["check-circle"]=10709790387,["check-circle-2"]=10709790298,["check-square"]=10709790537,["chef-hat"]=10709790757,["cherry"]=10709790875,["chevron-down"]=10709790948,["chevron-first"]=10709791015,["chevron-last"]=10709791130,["chevron-left"]=10709791281,["chevron-right"]=10709791437,["chevron-up"]=10709791523,["chevrons-down"]=10709796864,["chevrons-down-up"]=10709791632,["chevrons-left"]=10709797151,["chevrons-left-right"]=10709797006,["chevrons-right"]=10709797382,["chevrons-right-left"]=10709797274,["chevrons-up"]=10709797622,["chevrons-up-down"]=10709797508,["chrome"]=10709797725,["circle"]=10709798174,["circle-dot"]=10709797837,["circle-ellipsis"]=10709797985,["circle-slashed"]=10709798100,["citrus"]=10709798276,["clapperboard"]=10709798350,["clipboard"]=10709799288,["clipboard-check"]=10709798443,["clipboard-copy"]=10709798574,["clipboard-edit"]=10709798682,["clipboard-list"]=10709798792,["clipboard-signature"]=10709798890,["clipboard-type"]=10709798999,["clipboard-x"]=10709799124,["clock"]=10709805144,["clock-1"]=10709799535,["clock-10"]=10709799718,["clock-11"]=10709799818,["clock-12"]=10709799962,["clock-2"]=10709803876,["clock-3"]=10709803989,["clock-4"]=10709804164,["clock-5"]=10709804291,["clock-6"]=10709804435,["clock-7"]=10709804599,["clock-8"]=10709804784,["clock-9"]=10709804996,["cloud"]=10709806740,["cloud-cog"]=10709805262,["cloud-drizzle"]=10709805371,["cloud-fog"]=10709805477,["cloud-hail"]=10709805596,["cloud-lightning"]=10709805727,["cloud-moon"]=10709805942,["cloud-moon-rain"]=10709805838,["cloud-off"]=10709806060,["cloud-rain"]=10709806277,["cloud-rain-wind"]=10709806166,["cloud-snow"]=10709806374,["cloud-sun"]=10709806631,["cloud-sun-rain"]=10709806475,["cloudy"]=10709806859,["clover"]=10709806995,["code"]=10709810463,["code-2"]=10709807111,["codepen"]=10709810534,["codesandbox"]=10709810676,["coffee"]=10709810814,["cog"]=10709810948,["coins"]=10709811110,["columns"]=10709811261,["command"]=10709811365,["compass"]=10709811445,["component"]=10709811595,["concierge-bell"]=10709811706,["connection"]=10747361219,["contact"]=10709811834,["contrast"]=10709811939,["cookie"]=10709812067,["copy"]=10709812159,["copyleft"]=10709812251,["copyright"]=10709812311,["corner-down-left"]=10709812396,["corner-down-right"]=10709812485,["corner-left-down"]=10709812632,["corner-left-up"]=10709812784,["corner-right-down"]=10709812939,["corner-right-up"]=10709813094,["corner-up-left"]=10709813185,["corner-up-right"]=10709813281,["cpu"]=10709813383,["croissant"]=10709818125,["crop"]=10709818245,["cross"]=10709818399,["crosshair"]=10709818534,["crown"]=10709818626,["cup-soda"]=10709818763,["curly-braces"]=10709818847,["currency"]=10709818931,["database"]=10709818996,["delete"]=10709819059,["diamond"]=10709819149,["dice-1"]=10709819266,["dice-2"]=10709819361,["dice-3"]=10709819508,["dice-4"]=10709819670,["dice-5"]=10709819801,["dice-6"]=10709819896,["dices"]=10723343321,["diff"]=10723343416,["disc"]=10723343537,["divide"]=10723343805,["divide-circle"]=10723343636,["divide-square"]=10723343737,["dollar-sign"]=10723343958,["download"]=10723344270,["download-cloud"]=10723344088,["droplet"]=10723344432,["droplets"]=10734883356,["drumstick"]=10723344737,["edit"]=10734883598,["edit-2"]=10723344885,["edit-3"]=10723345088,["egg"]=10723345518,["egg-fried"]=10723345347,["electricity"]=10723345749,["electricity-off"]=10723345643,["equal"]=10723345990,["equal-not"]=10723345866,["eraser"]=10723346158,["euro"]=10723346372,["expand"]=10723346553,["external-link"]=10723346684,["eye"]=10723346959,["eye-off"]=10723346871,["factory"]=10723347051,["fan"]=10723354359,["fast-forward"]=10723354521,["feather"]=10723354671,["figma"]=10723354801,["file"]=10723374641,["file-archive"]=10723354921,["file-audio"]=10723355148,["file-audio-2"]=10723355026,["file-axis-3d"]=10723355272,["file-badge"]=10723355622,["file-badge-2"]=10723355451,["file-bar-chart"]=10723355887,["file-bar-chart-2"]=10723355746,["file-box"]=10723355989,["file-check"]=10723356210,["file-check-2"]=10723356100,["file-clock"]=10723356329,["file-code"]=10723356507,["file-cog"]=10723356830,["file-cog-2"]=10723356676,["file-diff"]=10723357039,["file-digit"]=10723357151,["file-down"]=10723357322,["file-edit"]=10723357495,["file-heart"]=10723357637,["file-image"]=10723357790,["file-input"]=10723357933,["file-json"]=10723364435,["file-json-2"]=10723364361,["file-key"]=10723364605,["file-key-2"]=10723364515,["file-line-chart"]=10723364725,["file-lock"]=10723364957,["file-lock-2"]=10723364861,["file-minus"]=10723365254,["file-minus-2"]=10723365086,["file-output"]=10723365457,["file-pie-chart"]=10723365598,["file-plus"]=10723365877,["file-plus-2"]=10723365766,["file-question"]=10723365987,["file-scan"]=10723366167,["file-search"]=10723366550,["file-search-2"]=10723366340,["file-signature"]=10723366741,["file-spreadsheet"]=10723366962,["file-symlink"]=10723367098,["file-terminal"]=10723367244,["file-text"]=10723367380,["file-type"]=10723367606,["file-type-2"]=10723367509,["file-up"]=10723367734,["file-video"]=10723373884,["file-video-2"]=10723367834,["file-volume"]=10723374172,["file-volume-2"]=10723374030,["file-warning"]=10723374276,["file-x"]=10723374544,["file-x-2"]=10723374378,["files"]=10723374759,["film"]=10723374981,["filter"]=10723375128,["fingerprint"]=10723375250,["flag"]=10723375890,["flag-off"]=10723375443,["flag-triangle-left"]=10723375608,["flag-triangle-right"]=10723375727,["flame"]=10723376114,["flashlight"]=10723376471,["flashlight-off"]=10723376365,["flask-conical"]=10734883986,["flask-round"]=10723376614,["flip-horizontal"]=10723376884,["flip-horizontal-2"]=10723376745,["flip-vertical"]=10723377138,["flip-vertical-2"]=10723377026,["flower"]=10747830374,["flower-2"]=10723377305,["focus"]=10723377537,["folder"]=10723387563,["folder-archive"]=10723384478,["folder-check"]=10723384605,["folder-clock"]=10723384731,["folder-closed"]=10723384893,["folder-cog"]=10723385213,["folder-cog-2"]=10723385036,["folder-down"]=10723385338,["folder-edit"]=10723385445,["folder-heart"]=10723385545,["folder-input"]=10723385721,["folder-key"]=10723385848,["folder-lock"]=10723386005,["folder-minus"]=10723386127,["folder-open"]=10723386277,["folder-output"]=10723386386,["folder-plus"]=10723386531,["folder-search"]=10723386787,["folder-search-2"]=10723386674,["folder-symlink"]=10723386930,["folder-tree"]=10723387085,["folder-up"]=10723387265,["folder-x"]=10723387448,["folders"]=10723387721,["form-input"]=10723387841,["forward"]=10723388016,["frame"]=10723394389,["framer"]=10723394565,["frown"]=10723394681,["fuel"]=10723394846,["function-square"]=10723395041,["gamepad"]=10723395457,["gamepad-2"]=10723395215,["gauge"]=10723395708,["gavel"]=10723395896,["gem"]=10723396000,["ghost"]=10723396107,["gift"]=10723396402,["gift-card"]=10723396225,["git-branch"]=10723396676,["git-branch-plus"]=10723396542,["git-commit"]=10723396812,["git-compare"]=10723396954,["git-fork"]=10723397049,["git-merge"]=10723397165,["git-pull-request"]=10723397431,["git-pull-request-closed"]=10723397268,["git-pull-request-draft"]=10734884302,["glass"]=10723397788,["glass-2"]=10723397529,["glass-water"]=10723397678,["glasses"]=10723397895,["globe"]=10723404337,["globe-2"]=10723398002,["grab"]=10723404472,["graduation-cap"]=10723404691,["grape"]=10723404822,["grid"]=10723404936,["grip-horizontal"]=10723405089,["grip-vertical"]=10723405236,["hammer"]=10723405360,["hand"]=10723405649,["hand-metal"]=10723405508,["hard-drive"]=10723405749,["hard-hat"]=10723405859,["hash"]=10723405975,["haze"]=10723406078,["headphones"]=10723406165,["heart"]=10723406885,["heart-crack"]=10723406299,["heart-handshake"]=10723406480,["heart-off"]=10723406662,["heart-pulse"]=10723406795,["help-circle"]=10723406988,["hexagon"]=10723407092,["highlighter"]=10723407192,["history"]=10723407335,["home"]=10723407389,["hourglass"]=10723407498,["ice-cream"]=10723414308,["image"]=10723415040,["image-minus"]=10723414487,["image-off"]=10723414677,["image-plus"]=10723414827,["import"]=10723415205,["inbox"]=10723415335,["indent"]=10723415494,["indian-rupee"]=10723415642,["infinity"]=10723415766,["info"]=10723415903,["inspect"]=10723416057,["italic"]=10723416195,["japanese-yen"]=10723416363,["joystick"]=10723416527,["key"]=10723416652,["keyboard"]=10723416765,["lamp"]=10723417513,["lamp-ceiling"]=10723416922,["lamp-desk"]=10723417016,["lamp-floor"]=10723417131,["lamp-wall-down"]=10723417240,["lamp-wall-up"]=10723417356,["landmark"]=10723417608,["languages"]=10723417703,["laptop"]=10723423881,["laptop-2"]=10723417797,["lasso"]=10723424235,["lasso-select"]=10723424058,["laugh"]=10723424372,["layers"]=10723424505,["layout"]=10723425376,["layout-dashboard"]=10723424646,["layout-grid"]=10723424838,["layout-list"]=10723424963,["layout-template"]=10723425187,["leaf"]=10723425539,["library"]=10723425615,["life-buoy"]=10723425685,["lightbulb"]=10723425852,["lightbulb-off"]=10723425762,["line-chart"]=10723426393,["link"]=10723426722,["link-2"]=10723426595,["link-2-off"]=10723426513,["list"]=10723433811,["list-checks"]=10734884548,["list-end"]=10723426886,["list-minus"]=10723426986,["list-music"]=10723427081,["list-ordered"]=10723427199,["list-plus"]=10723427334,["list-start"]=10723427494,["list-video"]=10723427619,["list-x"]=10723433655,["loader"]=10723434070,["loader-2"]=10723433935,["locate"]=10723434557,["locate-fixed"]=10723434236,["locate-off"]=10723434379,["lock"]=10723434711,["log-in"]=10723434830,["log-out"]=10723434906,["luggage"]=10723434993,["magnet"]=10723435069,["mail"]=10734885430,["mail-check"]=10723435182,["mail-minus"]=10723435261,["mail-open"]=10723435342,["mail-plus"]=10723435443,["mail-question"]=10723435515,["mail-search"]=10734884739,["mail-warning"]=10734885015,["mail-x"]=10734885247,["mails"]=10734885614,["map"]=10734886202,["map-pin"]=10734886004,["map-pin-off"]=10734885803,["maximize"]=10734886735,["maximize-2"]=10734886496,["medal"]=10734887072,["megaphone"]=10734887454,["megaphone-off"]=10734887311,["meh"]=10734887603,["menu"]=10734887784,["message-circle"]=10734888000,["message-square"]=10734888228,["mic"]=10734888864,["mic-2"]=10734888430,["mic-off"]=10734888646,["microscope"]=10734889106,["microwave"]=10734895076,["milestone"]=10734895310,["minimize"]=10734895698,["minimize-2"]=10734895530,["minus"]=10734896206,["minus-circle"]=10734895856,["minus-square"]=10734896029,["monitor"]=10734896881,["monitor-off"]=10734896360,["monitor-speaker"]=10734896512,["moon"]=10734897102,["more-horizontal"]=10734897250,["more-vertical"]=10734897387,["mountain"]=10734897956,["mountain-snow"]=10734897665,["mouse"]=10734898592,["mouse-pointer"]=10734898476,["mouse-pointer-2"]=10734898194,["mouse-pointer-click"]=10734898355,["move"]=10734900011,["move-3d"]=10734898756,["move-diagonal"]=10734899164,["move-diagonal-2"]=10734898934,["move-horizontal"]=10734899414,["move-vertical"]=10734899821,["music"]=10734905958,["music-2"]=10734900215,["music-3"]=10734905665,["music-4"]=10734905823,["navigation"]=10734906744,["navigation-2"]=10734906332,["navigation-2-off"]=10734906144,["navigation-off"]=10734906580,["network"]=10734906975,["newspaper"]=10734907168,["octagon"]=10734907361,["option"]=10734907649,["outdent"]=10734907933,["package"]=10734909540,["package-2"]=10734908151,["package-check"]=10734908384,["package-minus"]=10734908626,["package-open"]=10734908793,["package-plus"]=10734909016,["package-search"]=10734909196,["package-x"]=10734909375,["paint-bucket"]=10734909847,["paintbrush"]=10734910187,["paintbrush-2"]=10734910030,["palette"]=10734910430,["palmtree"]=10734910680,["paperclip"]=10734910927,["party-popper"]=10734918735,["pause"]=10734919336,["pause-circle"]=10735024209,["pause-octagon"]=10734919143,["pen-tool"]=10734919503,["pencil"]=10734919691,["percent"]=10734919919,["person-standing"]=10734920149,["phone"]=10734921524,["phone-call"]=10734920305,["phone-forwarded"]=10734920508,["phone-incoming"]=10734920694,["phone-missed"]=10734920845,["phone-off"]=10734921077,["phone-outgoing"]=10734921288,["pie-chart"]=10734921727,["piggy-bank"]=10734921935,["pin"]=10734922324,["pin-off"]=10734922180,["pipette"]=10734922497,["pizza"]=10734922774,["plane"]=10734922971,["play"]=10734923549,["play-circle"]=10734923214,["plus"]=10734924532,["plus-circle"]=10734923868,["plus-square"]=10734924219,["podcast"]=10734929553,["pointer"]=10734929723,["pound-sterling"]=10734929981,["power"]=10734930466,["power-off"]=10734930257,["printer"]=10734930632,["puzzle"]=10734930886,["quote"]=10734931234,["radio"]=10734931596,["radio-receiver"]=10734931402,["rectangle-horizontal"]=10734931777,["rectangle-vertical"]=10734932081,["recycle"]=10734932295,["redo"]=10734932822,["redo-2"]=10734932586,["refresh-ccw"]=10734933056,["refresh-cw"]=10734933222,["refrigerator"]=10734933465,["regex"]=10734933655,["repeat"]=10734933966,["repeat-1"]=10734933826,["reply"]=10734934252,["reply-all"]=10734934132,["rewind"]=10734934347,["rocket"]=10734934585,["rocking-chair"]=10734939942,["rotate-3d"]=10734940107,["rotate-ccw"]=10734940376,["rotate-cw"]=10734940654,["rss"]=10734940825,["ruler"]=10734941018,["russian-ruble"]=10734941199,["sailboat"]=10734941354,["save"]=10734941499,["scale"]=10734941912,["scale-3d"]=10734941739,["scaling"]=10734942072,["scan"]=10734942565,["scan-face"]=10734942198,["scan-line"]=10734942351,["scissors"]=10734942778,["screen-share"]=10734943193,["screen-share-off"]=10734942967,["scroll"]=10734943448,["search"]=10734943674,["send"]=10734943902,["separator-horizontal"]=10734944115,["separator-vertical"]=10734944326,["server"]=10734949856,["server-cog"]=10734944444,["server-crash"]=10734944554,["server-off"]=10734944668,["settings"]=10734950309,["settings-2"]=10734950020,["share"]=10734950813,["share-2"]=10734950553,["sheet"]=10734951038,["shield"]=10734951847,["shield-alert"]=10734951173,["shield-check"]=10734951367,["shield-close"]=10734951535,["shield-off"]=10734951684,["shirt"]=10734952036,["shopping-bag"]=10734952273,["shopping-cart"]=10734952479,["shovel"]=10734952773,["shower-head"]=10734952942,["shrink"]=10734953073,["shrub"]=10734953241,["shuffle"]=10734953451,["sidebar"]=10734954301,["sidebar-close"]=10734953715,["sidebar-open"]=10734954000,["sigma"]=10734954538,["signal"]=10734961133,["signal-high"]=10734954807,["signal-low"]=10734955080,["signal-medium"]=10734955336,["signal-zero"]=10734960878,["siren"]=10734961284,["skip-back"]=10734961526,["skip-forward"]=10734961809,["skull"]=10734962068,["slack"]=10734962339,["slash"]=10734962600,["slice"]=10734963024,["sliders"]=10734963400,["sliders-horizontal"]=10734963191,["smartphone"]=10734963940,["smartphone-charging"]=10734963671,["smile"]=10734964441,["smile-plus"]=10734964188,["snowflake"]=10734964600,["sofa"]=10734964852,["sort-asc"]=10734965115,["sort-desc"]=10734965287,["speaker"]=10734965419,["sprout"]=10734965572,["square"]=10734965702,["star"]=10734966248,["star-half"]=10734965897,["star-off"]=10734966097,["stethoscope"]=10734966384,["sticker"]=10734972234,["sticky-note"]=10734972463,["stop-circle"]=10734972621,["stretch-horizontal"]=10734972862,["stretch-vertical"]=10734973130,["strikethrough"]=10734973290,["subscript"]=10734973457,["sun"]=10734974297,["sun-dim"]=10734973645,["sun-medium"]=10734973778,["sun-moon"]=10734973999,["sun-snow"]=10734974130,["sunrise"]=10734974522,["sunset"]=10734974689,["superscript"]=10734974850,["swiss-franc"]=10734975024,["switch-camera"]=10734975214,["sword"]=10734975486,["swords"]=10734975692,["syringe"]=10734975932,["table"]=10734976230,["table-2"]=10734976097,["tablet"]=10734976394,["tag"]=10734976528,["tags"]=10734976739,["target"]=10734977012,["tent"]=10734981750,["terminal"]=10734982144,["terminal-square"]=10734981995,["text-cursor"]=10734982395,["text-cursor-input"]=10734982297,["thermometer"]=10734983134,["thermometer-snowflake"]=10734982571,["thermometer-sun"]=10734982771,["thumbs-down"]=10734983359,["thumbs-up"]=10734983629,["ticket"]=10734983868,["timer"]=10734984606,["timer-off"]=10734984138,["timer-reset"]=10734984355,["toggle-left"]=10734984834,["toggle-right"]=10734985040,["tornado"]=10734985247,["toy-brick"]=10747361919,["train"]=10747362105,["trash"]=10747362393,["trash-2"]=10747362241,["tree-deciduous"]=10747362534,["tree-pine"]=10747362748,["trees"]=10747363016,["trending-down"]=10747363205,["trending-up"]=10747363465,["triangle"]=10747363621,["trophy"]=10747363809,["truck"]=10747364031,["tv"]=10747364593,["tv-2"]=10747364302,["type"]=10747364761,["umbrella"]=10747364971,["underline"]=10747365191,["undo"]=10747365484,["undo-2"]=10747365359,["unlink"]=10747365771,["unlink-2"]=10747397871,["unlock"]=10747366027,["upload"]=10747366434,["upload-cloud"]=10747366266,["usb"]=10747366606,["user"]=10747373176,["user-check"]=10747371901,["user-cog"]=10747372167,["user-minus"]=10747372346,["user-plus"]=10747372702,["user-x"]=10747372992,["users"]=10747373426,["utensils"]=10747373821,["utensils-crossed"]=10747373629,["venetian-mask"]=10747374003,["verified"]=10747374131,["vibrate"]=10747374489,["vibrate-off"]=10747374269,["video"]=10747374938,["video-off"]=10747374721,["view"]=10747375132,["voicemail"]=10747375281,["volume"]=10747376008,["volume-1"]=10747375450,["volume-2"]=10747375679,["volume-x"]=10747375880,["wallet"]=10747376205,["wand"]=10747376565,["wand-2"]=10747376349,["watch"]=10747376722,["waves"]=10747376931,["webcam"]=10747381992,["wifi"]=10747382504,["wifi-off"]=10747382268,["wind"]=10747382750,["wrap-text"]=10747383065,["wrench"]=10747383470,["x"]=10747384394,["x-circle"]=10747383819,["x-octagon"]=10747384037,["x-square"]=10747384217,["zoom-in"]=10747384552,["zoom-out"]=10747384679}
+
+local function GetIcon(icon)
+	if icon == nil or icon == "" then return nil end
+	if type(icon) == "number" then return "rbxassetid://" .. icon end
+	if type(icon) ~= "string" then return nil end
+	if icon:find("^rbxasset") or icon:find("^rbxthumb") or icon:find("^http") then return icon end
+	if tonumber(icon) then return "rbxassetid://" .. icon end
+	local name = icon:gsub("^lucide[%-:]", ""):gsub("^geist:", ""):lower()
+	local id = IconMap[name]
+	if id then return "rbxassetid://" .. id end
+	return nil
+end
+WindUI.GetIcon = GetIcon
+
+function WindUI:AddIcons(map)
+	for k, v in pairs(map or {}) do
+		IconMap[tostring(k):lower()] = tonumber(tostring(v):match("%d+"))
+	end
+end
+
+--------------------------------------------------------------------------
+-- 主题 (17 套)
+--------------------------------------------------------------------------
+local function RGB(r, g, b) return Color3.fromRGB(r, g, b) end
+local WHITE, BLACK = RGB(255, 255, 255), RGB(0, 0, 0)
+
+local DarkBase = {
+	Dark = true,
+	GlassT = 0.14, Panel = WHITE, PanelT = 0.955,
+	Element = WHITE, ElementT = 0.945, HoverDelta = 0.035,
+	Stroke = WHITE, StrokeT = 0.3, ElementStrokeT = 0.74,
+	Text = RGB(236, 239, 245), SubText = RGB(152, 158, 174), Placeholder = RGB(110, 116, 132),
+	Field = BLACK, FieldT = 0.7, Shadow = BLACK, ShadowT = 0.3,
+	Track = WHITE, TrackT = 0.84, SheenT = 0.88, NoiseT = 0.955,
+	Backdrop = BLACK, BackdropT = 0.45,
+	Success = RGB(52, 211, 153), Warning = RGB(251, 191, 36), Error = RGB(248, 113, 113),
+	-- 主题色只点缀小部件; 大面积 (选中项 / 激活卡片) 用很淡的染色
+	InnerT = 0.55, IndicatorT = 0.88, ActiveT = 0.95, SelectT = 0.88,
+	GlassShade = RGB(196, 198, 210),
+}
+
+local LightBase = {
+	Dark = false,
+	GlassT = 0.12, Panel = WHITE, PanelT = 0.4,
+	Element = WHITE, ElementT = 0.2, HoverDelta = 0.1,
+	Stroke = WHITE, StrokeT = 0.05, ElementStrokeT = 0.3,
+	Text = RGB(29, 31, 40), SubText = RGB(102, 108, 124), Placeholder = RGB(150, 155, 170),
+	Field = BLACK, FieldT = 0.94, Shadow = BLACK, ShadowT = 0.7,
+	Track = BLACK, TrackT = 0.88, SheenT = 0.55, NoiseT = 0.97,
+	Backdrop = BLACK, BackdropT = 0.65,
+	Success = RGB(16, 185, 129), Warning = RGB(217, 119, 6), Error = RGB(220, 38, 38),
+	InnerT = 0.88, IndicatorT = 0.1, ActiveT = 0.92, SelectT = 0.9,
+	GlassShade = RGB(238, 240, 246),
+}
+
+-- 实心主题色上的文字: 白字对比度够用 (>= 3.4) 时优先白字, 否则按 WCAG 对比度取更高者
+local ON_DARK = RGB(20, 22, 28)
+local function Luminance(c)
+	local function lin(v)
+		if v <= 0.03928 then return v / 12.92 end
+		return ((v + 0.055) / 1.055) ^ 2.4
+	end
+	return 0.2126 * lin(c.R) + 0.7152 * lin(c.G) + 0.0722 * lin(c.B)
+end
+local function AutoOnAccent(c)
+	local l = Luminance(c)
+	local vsWhite = 1.05 / (l + 0.05)
+	local vsDark = (l + 0.05) / (Luminance(ON_DARK) + 0.05)
+	if vsWhite >= 3.4 or vsWhite >= vsDark then return WHITE end
+	return ON_DARK
+end
+
+local function MakeTheme(name, base, over)
+	local t = {}
+	for k, v in pairs(base) do t[k] = v end
+	for k, v in pairs(over) do t[k] = v end
+	t.Name = name
+	if t.OnAccent == nil then t.OnAccent = AutoOnAccent(t.Accent) end
+	return t
+end
+
+local function RegisterTheme(t)
+	if not WindUI.Themes[t.Name] then
+		table.insert(WindUI.ThemeOrder, t.Name)
+	end
+	WindUI.Themes[t.Name] = t
+end
+
+-- 配色原则: 渐变两端取相邻色; 深色底为近中性炭黑, 只带一点主题色调;
+-- 深色主题用偏亮的主题色, 浅色主题用更深一档的主题色以保证对比度
+for _, def in ipairs({
+	{ "Dark",     DarkBase,  { Accent = RGB(10, 132, 255),  Accent2 = RGB(94, 92, 230),   Glass = RGB(16, 18, 24) } },
+	{ "Midnight", DarkBase,  { Accent = RGB(129, 140, 248), Accent2 = RGB(167, 139, 250), Glass = RGB(12, 13, 24) } },
+	{ "Aurora",   DarkBase,  { Accent = RGB(45, 212, 191),  Accent2 = RGB(56, 189, 248),  Glass = RGB(11, 19, 22) } },
+	{ "Sakura",   DarkBase,  { Accent = RGB(244, 143, 177), Accent2 = RGB(232, 121, 249), Glass = RGB(23, 17, 21) } },
+	{ "Ocean",    DarkBase,  { Accent = RGB(56, 189, 248),  Accent2 = RGB(59, 130, 246),  Glass = RGB(11, 17, 26) } },
+	{ "Sunset",   DarkBase,  { Accent = RGB(251, 146, 60),  Accent2 = RGB(248, 113, 113), Glass = RGB(23, 16, 15) } },
+	{ "Emerald",  DarkBase,  { Accent = RGB(52, 211, 153),  Accent2 = RGB(45, 212, 191),  Glass = RGB(11, 20, 17) } },
+	{ "Amethyst", DarkBase,  { Accent = RGB(192, 132, 252), Accent2 = RGB(232, 121, 249), Glass = RGB(19, 15, 26) } },
+	{ "Crimson",  DarkBase,  { Accent = RGB(244, 63, 94),   Accent2 = RGB(251, 113, 133), Glass = RGB(23, 13, 16) } },
+	{ "Gold",     DarkBase,  { Accent = RGB(251, 191, 36),  Accent2 = RGB(251, 146, 60),  Glass = RGB(21, 18, 12) } },
+	{ "Cyber",    DarkBase,  { Accent = RGB(34, 211, 238),  Accent2 = RGB(192, 132, 252), Glass = RGB(12, 12, 22) } },
+	{ "Mint",     DarkBase,  { Accent = RGB(110, 231, 183), Accent2 = RGB(94, 234, 212),  Glass = RGB(12, 21, 20) } },
+	{ "Graphite", DarkBase,  { Accent = RGB(229, 231, 235), Accent2 = RGB(161, 161, 170), Glass = RGB(19, 19, 21) } },
+	{ "Light",    LightBase, { Accent = RGB(0, 122, 255),   Accent2 = RGB(88, 86, 214),   Glass = RGB(243, 245, 249) } },
+	{ "Pearl",    LightBase, { Accent = RGB(205, 92, 120),  Accent2 = RGB(226, 135, 98),  Glass = RGB(249, 245, 244) } },
+	{ "Arctic",   LightBase, { Accent = RGB(8, 145, 178),   Accent2 = RGB(37, 99, 235),   Glass = RGB(240, 246, 249) } },
+	{ "Lavender", LightBase, { Accent = RGB(124, 58, 237),  Accent2 = RGB(147, 51, 234),  Glass = RGB(245, 243, 252) } },
+}) do
+	RegisterTheme(MakeTheme(def[1], def[2], def[3]))
+end
+WindUI.Theme = WindUI.Themes.Dark
+
+-- 玻璃底色透明度: 主题基准 + 用户滑块 + 模糊开启时更通透
+local function GlassT(th)
+	local t = th.GlassT + (WindUI.Transparency - 0.5) * 0.6 + (WindUI.Acrylic and 0.14 or 0)
+	return math.clamp(t, 0, 0.93)
+end
+
+function WindUI:SetTheme(name)
+	local th = self.Themes[name]
+	if not th then return false end
+	self.Theme = th
+	self.CurrentThemeName = name
+	ApplyTheme(false)
+	return true
+end
+
+function WindUI:GetThemes()
+	return self.Themes
+end
+
+function WindUI:GetCurrentTheme()
+	return self.CurrentThemeName
+end
+
+function WindUI:OnThemeChange(fn)
+	table.insert(ThemeListeners, fn)
+end
+
+-- 兼容 WindUI 主题格式: { Name, Accent, Background, Outline, Text, Placeholder, Button, Icon }
+function WindUI:AddTheme(t)
+	assert(type(t) == "table" and t.Name, "AddTheme: Name required")
+	local glass = ToColor(t.Glass or t.Background, RGB(14, 16, 26))
+	local isDark = t.Dark
+	if isDark == nil then
+		isDark = (glass.R * 0.299 + glass.G * 0.587 + glass.B * 0.114) < 0.55
+	end
+	local over = { Glass = glass }
+	for k, v in pairs(t) do
+		if k ~= "Name" and k ~= "Background" then
+			over[k] = (typeof(v) == "Color3" or type(v) ~= "string") and v or ToColor(v, v)
+		end
+	end
+	over.Accent = ToColor(t.Accent, RGB(96, 165, 250))
+	over.Accent2 = ToColor(t.Accent2, over.Accent)
+	if t.Outline then over.Stroke = ToColor(t.Outline, WHITE) end
+	if t.Placeholder and not t.SubText then over.SubText = ToColor(t.Placeholder, nil) end
+	if t.Text then over.Text = ToColor(t.Text, nil) end
+	RegisterTheme(MakeTheme(t.Name, isDark and DarkBase or LightBase, over))
+	return self.Themes[t.Name]
+end
+
+function WindUI:SetTransparency(alpha)
+	self.Transparency = Clamp01(alpha)
+	ApplyTheme(false)
+end
+
+function WindUI:GetTransparency()
+	return self.Transparency
+end
+
+function WindUI:SetFont(font)
+	self.Font = font
+	FontCache = {}
+end
+
+function WindUI:Gradient(stops, props)
+	local cps, tps = {}, {}
+	local keys = {}
+	for k in pairs(stops) do table.insert(keys, tonumber(k)) end
+	table.sort(keys)
+	for _, k in ipairs(keys) do
+		local s = stops[tostring(k)] or stops[k]
+		table.insert(cps, { k / 100, ToColor(s.Color, WHITE) })
+		table.insert(tps, { k / 100, s.Transparency or 0 })
+	end
+	local g = { Color = CS(cps), Transparency = NS(tps) }
+	for k, v in pairs(props or {}) do g[k] = v end
+	return g
+end
+
+-- 本地化接口 (保留 WindUI 调用形式, 无翻译时原样显示)
+function WindUI:Localization() return { Enabled = false } end
+function WindUI:SetLanguage() end
+function WindUI:SetNotificationLower(v) self.NotificationLower = v and true or false end
+
+--------------------------------------------------------------------------
+-- 根 ScreenGui
+--------------------------------------------------------------------------
+local function ProtectGui(gui)
+	pcall(function()
+		if syn and syn.protect_gui then syn.protect_gui(gui) end
+		if protectgui then protectgui(gui) end
+	end)
+end
+
+local function MountGui(gui)
+	ProtectGui(gui)
+	local ok = pcall(function()
+		local h = gethui and gethui()
+		if not h then error("no gethui") end
+		gui.Parent = h
+	end)
+	if not ok then
+		ok = pcall(function() gui.Parent = GetService("CoreGui") end)
+	end
+	if not ok or not gui.Parent then
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+end
+
+local function NewScreenGui(name, order, ignoreInset)
+	local gui = Create("ScreenGui", {
+		Name = name,
+		ResetOnSpawn = false,
+		IgnoreGuiInset = ignoreInset and true or false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = order,
+	})
+	MountGui(gui)
+	return gui
+end
+
+local Overlay
+local function GetOverlay()
+	if Overlay and Overlay.Parent then return Overlay end
+	Overlay = NewScreenGui("LiquidGlass_Overlay", 10010)
+	return Overlay
+end
+
+--------------------------------------------------------------------------
+-- 玻璃材质组件
+--------------------------------------------------------------------------
+local ASSET_SHADOW = "rbxassetid://8992230677"
+local ASSET_NOISE = "rbxassetid://9968344227"
+
+-- 高光边缘: 静态, 光源固定在左上; 迎光一侧亮, 背光一侧只有很弱的反光
+local SPECULAR = NS({ { 0, 0.15 }, { 0.3, 0.6 }, { 0.5, 0.9 }, { 0.75, 0.85 }, { 1, 0.6 } })
+
+local function Rim(parent, transparency, thickness, rotation)
+	local stroke = Create("UIStroke", {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Thickness = thickness or 1,
+		Theme = { Color = "Stroke", Transparency = transparency or "StrokeT" },
+		Parent = parent,
+	})
+	local grad = Create("UIGradient", {
+		Rotation = rotation or 45,
+		Transparency = SPECULAR,
+		Parent = stroke,
+	})
+	return stroke, grad
+end
+
+local function Sheen(parent, radius, z)
+	local f = Create("Frame", {
+		Name = "Sheen",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = z or 1,
+		Theme = { BackgroundTransparency = "SheenT" },
+		Parent = parent,
+	}, {
+		Create("UIGradient", {
+			Rotation = 90,
+			Transparency = NS({ { 0, 0 }, { 0.35, 0.75 }, { 0.6, 1 }, { 1, 1 } }),
+		}),
+	})
+	Corner(radius, f)
+	return f
+end
+
+local function Shadow(parent, spread, z)
+	return Create("ImageLabel", {
+		Name = "Shadow",
+		Image = ASSET_SHADOW,
+		ScaleType = Enum.ScaleType.Slice,
+		SliceCenter = Rect.new(99, 99, 99, 99),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 4),
+		Size = UDim2.new(1, spread or 90, 1, spread or 90),
+		BackgroundTransparency = 1,
+		ZIndex = z or 0,
+		Theme = { ImageColor3 = "Shadow", ImageTransparency = "ShadowT" },
+		Parent = parent,
+	})
+end
+
+local function Noise(parent, radius, z)
+	local n = Create("ImageLabel", {
+		Name = "Noise",
+		Image = ASSET_NOISE,
+		ScaleType = Enum.ScaleType.Tile,
+		TileSize = UDim2.new(0, 128, 0, 128),
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = z or 1,
+		Theme = { ImageTransparency = "NoiseT" },
+		Parent = parent,
+	})
+	Corner(radius, n)
+	return n
+end
+
+local function Mix(a, b, t)
+	return Color3.new(a.R + (b.R - a.R) * t, a.G + (b.G - a.G) * t, a.B + (b.B - a.B) * t)
+end
+
+-- 标题文字渐变: 正文色 -> 偏主题色
+local function TitleSequence(th)
+	th = th or WindUI.Theme
+	return CS({ { 0, th.Text }, { 1, Mix(th.Text, th.Accent, 0.45) } })
+end
+
+-- AbsolutePosition / AbsoluteSize 是经过所有祖先 UIScale 缩放后的屏幕像素,
+-- 换算回本地偏移时要除以这个累计缩放
+local function EffectiveScale(gui)
+	local s = 1
+	local node = gui
+	while node and node.ClassName ~= "ScreenGui" do
+		local sc = node:FindFirstChildWhichIsA("UIScale")
+		if sc then s = s * sc.Scale end
+		node = node.Parent
+	end
+	return math.max(s, 0.01)
+end
+
+-- 让 frame 的高度跟随 source 的实际高度 (source 为其内部的 AutomaticSize 内容框)。
+-- 铺满型子元素 (Size.Y 带比例) 不能放进 AutomaticSize 容器: 它的高度取自容器自身,
+-- 带正偏移时每次重算都会把容器再撑高一截 (无限拉长)。外层改为固定高度后就安全了。
+local function FollowHeight(frame, source, extra)
+	-- 缩放动画期间每帧都会触发, 所以这里要便宜: 用 frame 自身 "屏幕高度 / 本地高度"
+	-- 得到累计缩放, 不必逐层向上查找 UIScale
+	local function update()
+		local cur = frame.Size
+		local abs = source.AbsoluteSize.Y
+		local s
+		if cur.Y.Scale == 0 and cur.Y.Offset > 0 and frame.AbsoluteSize.Y > 0 then
+			s = frame.AbsoluteSize.Y / cur.Y.Offset
+		else
+			s = EffectiveScale(source)
+		end
+		-- 窗口缩到几乎看不见时不更新, 等动画回来再算
+		if s < 0.05 or abs <= 0 then return end
+		local h = abs / s + (extra or 0)
+		if math.abs(cur.Y.Offset - h) > 0.5 or cur.Y.Scale ~= 0 then
+			frame.Size = UDim2.new(cur.X.Scale, cur.X.Offset, 0, h)
+		end
+	end
+	source:GetPropertyChangedSignal("AbsoluteSize"):Connect(update)
+	update()
+end
+
+-- 点击水波纹 (fx 为裁剪层)
+local function Ripple(fx)
+	local s = EffectiveScale(fx)
+	local m = MousePos()
+	local p, sz = fx.AbsolutePosition, fx.AbsoluteSize
+	local lx, ly = (m.X - p.X) / s, (m.Y - p.Y) / s
+	local w, h = sz.X / s, sz.Y / s
+	if lx < 0 or ly < 0 or lx > w or ly > h then lx, ly = w / 2, h / 2 end
+	local d = math.max(w, h) * 2.2
+	local r = Create("Frame", {
+		Name = "Ripple",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, lx, 0, ly),
+		Size = UDim2.new(0, 0, 0, 0),
+		BackgroundTransparency = 0.8,
+		BorderSizePixel = 0,
+		ZIndex = fx.ZIndex,
+		Theme = { BackgroundColor3 = function(th) return th.Dark and WHITE or th.Accent end },
+		Parent = fx,
+	})
+	Corner(UDim.new(1, 0), r)
+	Tween(r, TweenInfo.new(0.6, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+		Size = UDim2.new(0, d, 0, d),
+		BackgroundTransparency = 1,
+	})
+	task.delay(0.65, function() r:Destroy() end)
+end
+
+local function IconImage(icon, size, props)
+	local p = {
+		Name = "Icon",
+		Image = GetIcon(icon) or "",
+		Size = UDim2.new(0, size or 18, 0, size or 18),
+		BackgroundTransparency = 1,
+		Theme = { ImageColor3 = "Text" },
+	}
+	for k, v in pairs(props or {}) do p[k] = v end
+	return Create("ImageLabel", p)
+end
+
+-- 只有真的含富文本标签时才开 RichText: 富文本排版按主字体行高排回退字体,
+-- 中文里笔画偏高的字 (如 "复") 顶部会被截掉 / 压扁
+local function HasRichTag(s)
+	return type(s) == "string" and s:find("<%/?%a") ~= nil
+end
+
+local function Text(props)
+	local p = {
+		BackgroundTransparency = 1,
+		Font = "Medium",
+		TextSize = 14,
+		LineHeight = 1.1,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		Theme = { TextColor3 = "Text" },
+	}
+	for k, v in pairs(props) do p[k] = v end
+	if p.RichText == nil then p.RichText = HasRichTag(p.Text) end
+	local label = Create("TextLabel", p)
+	label:GetPropertyChangedSignal("Text"):Connect(function()
+		local rich = HasRichTag(label.Text)
+		if label.RichText ~= rich then label.RichText = rich end
+	end)
+	return label
+end
+
+-- 按压 / 悬停的液态缩放
+local function PressScale(button, target)
+	local scale = Create("UIScale", { Scale = 1, Parent = target or button })
+	button.MouseButton1Down:Connect(function()
+		Spring(scale, { Scale = 0.96 }, 6, 1)
+	end)
+	local function release()
+		Spring(scale, { Scale = 1 }, 4, 0.45)
+	end
+	button.MouseButton1Up:Connect(release)
+	button.MouseLeave:Connect(release)
+	return scale
+end
+
+-- 拖拽: began(input) / moved(input) / ended(input)
+local function OnDrag(handle, began, moved, ended)
+	handle.InputBegan:Connect(function(input)
+		if not IsClick(input) then return end
+		if began and began(input) == false then return end
+		local moveConn, endConn
+		moveConn = UserInputService.InputChanged:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseMovement or i == input
+				or (input.UserInputType == Enum.UserInputType.Touch and i.UserInputType == Enum.UserInputType.Touch) then
+				if moved then moved(i) end
+			end
+		end)
+		endConn = UserInputService.InputEnded:Connect(function(i)
+			if i == input or i.UserInputType == Enum.UserInputType.MouseButton1
+				or (input.UserInputType == Enum.UserInputType.Touch and i.UserInputType == Enum.UserInputType.Touch) then
+				moveConn:Disconnect()
+				endConn:Disconnect()
+				if ended then ended(i) end
+			end
+		end)
+	end)
+end
+
+--------------------------------------------------------------------------
+-- 真实背景模糊 (DepthOfField + 贴在镜头前的玻璃 Part)
+--------------------------------------------------------------------------
+local Acrylic = { Users = 0, Saved = {} }
+
+function Acrylic.EnableDOF()
+	if Acrylic.DOF then return end
+	for _, obj in ipairs(Lighting:GetChildren()) do
+		if obj:IsA("DepthOfFieldEffect") then
+			Acrylic.Saved[obj] = obj.Enabled
+			obj.Enabled = false
+		end
+	end
+	local dof = Instance.new("DepthOfFieldEffect")
+	dof.Name = "LiquidGlassDOF"
+	dof.FarIntensity = 0
+	dof.InFocusRadius = 0.1
+	dof.NearIntensity = 1
+	dof.Parent = Lighting
+	Acrylic.DOF = dof
+end
+
+function Acrylic.DisableDOF()
+	if Acrylic.DOF then
+		Acrylic.DOF:Destroy()
+		Acrylic.DOF = nil
+	end
+	for obj, en in pairs(Acrylic.Saved) do
+		pcall(function() obj.Enabled = en end)
+	end
+	Acrylic.Saved = {}
+end
+
+function Acrylic.New()
+	local part = Instance.new("Part")
+	part.Name = "LiquidGlassBlur"
+	part.Color = BLACK
+	part.Material = Enum.Material.Glass
+	part.Size = Vector3.new(1, 1, 0)
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Locked = true
+	part.CastShadow = false
+	part.Transparency = 0.98
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Brick
+	mesh.Offset = Vector3.new(0, 0, -1e-6)
+	mesh.Parent = part
+	return part, mesh
+end
+
+function Acrylic.Update(part, mesh, frame)
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local pos, size = frame.AbsolutePosition, frame.AbsoluteSize
+	local vy = cam.ViewportSize.Y
+	local inset = 8 + (math.clamp(vy, 0, 2560) / 2560) * 48
+	local tl = pos + Vector2.new(inset / 2, inset / 2)
+	local br = pos + size - Vector2.new(inset / 2, inset / 2)
+	local function at(x, y)
+		local ray = cam:ScreenPointToRay(x, y)
+		return ray.Origin + ray.Direction * 0.001
+	end
+	local p1, p2, p3 = at(tl.X, tl.Y), at(br.X, tl.Y), at(br.X, br.Y)
+	local cf = cam.CFrame
+	part.CFrame = CFrame.fromMatrix((p1 + p3) / 2, cf.XVector, cf.YVector, cf.ZVector)
+	mesh.Scale = Vector3.new((p2 - p1).Magnitude, (p2 - p3).Magnitude, 0)
+end
+
+--------------------------------------------------------------------------
+-- 悬浮提示
+--------------------------------------------------------------------------
+local Tooltip = {}
+function Tooltip.Get()
+	if Tooltip.Frame and Tooltip.Frame.Parent then return Tooltip.Frame end
+	local f = Create("Frame", {
+		Name = "Tooltip",
+		AutomaticSize = Enum.AutomaticSize.XY,
+		Size = UDim2.new(0, 0, 0, 0),
+		Visible = false,
+		ZIndex = 50,
+		Theme = { BackgroundColor3 = "Glass", BackgroundTransparency = function(th) return math.min(GlassT(th), 0.25) end },
+		Parent = GetOverlay(),
+	})
+	Corner(8, f)
+	Rim(f)
+	Padding(6, 6, 10, 10, f)
+	Tooltip.Label = Text({ Name = "Label", AutomaticSize = Enum.AutomaticSize.XY, TextSize = 12, ZIndex = 51, Parent = f })
+	Tooltip.Frame = f
+	return f
+end
+
+function Tooltip.Attach(gui, text)
+	if not text or text == "" then return end
+	local token = 0
+	gui.MouseEnter:Connect(function()
+		token = token + 1
+		local my = token
+		task.delay(0.45, function()
+			if my ~= token then return end
+			local f = Tooltip.Get()
+			Tooltip.Label.Text = text
+			local m = MousePos()
+			f.Position = UDim2.new(0, m.X + 14, 0, m.Y + 16)
+			f.Visible = true
+			Tooltip.Owner = gui
+		end)
+	end)
+	gui.MouseLeave:Connect(function()
+		token = token + 1
+		if Tooltip.Owner == gui and Tooltip.Frame then
+			Tooltip.Frame.Visible = false
+		end
+	end)
+	gui.MouseMoved:Connect(function()
+		if Tooltip.Owner == gui and Tooltip.Frame and Tooltip.Frame.Visible then
+			local m = MousePos()
+			Tooltip.Frame.Position = UDim2.new(0, m.X + 14, 0, m.Y + 16)
+		end
+	end)
+end
+
+--------------------------------------------------------------------------
+-- 通知
+--------------------------------------------------------------------------
+local NotifyHolder
+local function GetNotifyHolder()
+	if NotifyHolder and NotifyHolder.Parent then return NotifyHolder end
+	NotifyHolder = Create("Frame", {
+		Name = "Notifications",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -16, 1, -16),
+		Size = UDim2.new(0, 320, 1, -32),
+		BackgroundTransparency = 1,
+		Parent = GetOverlay(),
+	})
+	List(NotifyHolder, 10, false, { VerticalAlignment = Enum.VerticalAlignment.Bottom })
+	return NotifyHolder
+end
+
+local NotifyTypes = {
+	Success = { Icon = "check-circle", Color = "Success" },
+	Warning = { Icon = "alert-triangle", Color = "Warning" },
+	Error = { Icon = "x-circle", Color = "Error" },
+	Info = { Icon = "info", Color = "Accent" },
+}
+
+function WindUI:Notify(cfg)
+	cfg = cfg or {}
+	local holder = GetNotifyHolder()
+	holder.Position = UDim2.new(1, -16, 1, self.NotificationLower and -8 or -16)
+	local kind = NotifyTypes[cfg.Type or ""] or NotifyTypes.Info
+	local duration = cfg.Duration
+	if duration == nil then duration = 5 end
+	local N = { Closed = false }
+
+	local wrap = Create("Frame", {
+		Name = "Notification",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = math.floor(tick() * 10) % 1e8,
+		Parent = holder,
+	})
+	-- 卡片固定高度并跟随内容框 (光泽层 / 倒计时条贴底, 不能放进自动高度容器)
+	local card = Create("Frame", {
+		Name = "Card",
+		Size = UDim2.new(1, 0, 0, 60),
+		Position = UDim2.new(0, 360, 0, 0),
+		Theme = {
+			BackgroundColor3 = "Glass",
+			BackgroundTransparency = function(th) return math.min(GlassT(th), 0.3) end,
+		},
+		Parent = wrap,
+	})
+	Corner(14, card)
+	Rim(card)
+	Sheen(card, 14, 1)
+	local inner = Create("Frame", {
+		Name = "Inner",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = card,
+	})
+	Padding(12, 16, 14, 14, inner)
+	FollowHeight(card, inner)
+
+	local accentKey = kind.Color
+	local icon = cfg.Icon or kind.Icon
+	local iconBox = Create("Frame", {
+		Name = "IconBox",
+		Size = UDim2.new(0, 30, 0, 30),
+		ZIndex = 2,
+		Theme = { BackgroundColor3 = accentKey },
+		BackgroundTransparency = 0.82,
+		Parent = inner,
+	})
+	Corner(9, iconBox)
+	IconImage(icon, 17, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), ZIndex = 3,
+		Theme = { ImageColor3 = accentKey }, Parent = iconBox,
+	})
+
+	local body = Create("Frame", {
+		Name = "Body",
+		Position = UDim2.new(0, 42, 0, 0),
+		Size = UDim2.new(1, cfg.CanClose == false and -42 or -66, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = inner,
+	})
+	List(body, 3)
+	Text({ Name = "Title", Text = cfg.Title or "Notification", Font = "SemiBold", TextSize = 15,
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, ZIndex = 2, LayoutOrder = 1, Parent = body })
+	if cfg.Content and cfg.Content ~= "" then
+		Text({ Name = "Content", Text = tostring(cfg.Content), TextSize = 13, Font = "Regular",
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, ZIndex = 2, LayoutOrder = 2,
+			Theme = { TextColor3 = "SubText" }, Parent = body })
+	end
+	if cfg.SubContent and cfg.SubContent ~= "" then
+		Text({ Name = "SubContent", Text = tostring(cfg.SubContent), TextSize = 12, Font = "Regular",
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, ZIndex = 2, LayoutOrder = 3,
+			Theme = { TextColor3 = "Placeholder" }, Parent = body })
+	end
+
+	local bar
+	if duration and duration > 0 then
+		local track = Create("Frame", {
+			Name = "Timer",
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 14, 1, -7),
+			Size = UDim2.new(1, -28, 0, 2),
+			ZIndex = 2,
+			Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+			Parent = card,
+		})
+		Corner(1, track)
+		bar = Create("Frame", { Name = "Fill", Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = WHITE, ZIndex = 3, Parent = track })
+		Corner(1, bar)
+		local g = Create("UIGradient", { Parent = bar })
+		Bind(g, { Color = AccentSequence })
+	end
+
+	function N:Close()
+		if N.Closed then return end
+		N.Closed = true
+		Spring(card, { Position = UDim2.new(0, 360, 0, 0) }, 3.2, 1)
+		task.delay(0.22, function()
+			local h = wrap.AbsoluteSize.Y
+			wrap.AutomaticSize = Enum.AutomaticSize.None
+			wrap.Size = UDim2.new(1, 0, 0, h)
+			wrap.ClipsDescendants = true
+			Spring(wrap, { Size = UDim2.new(1, 0, 0, 0) }, 4, 1)
+			task.delay(0.4, function() wrap:Destroy() end)
+		end)
+	end
+
+	if cfg.CanClose ~= false then
+		local close = Create("ImageButton", {
+			Name = "Close",
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, 4, 0, -2),
+			Size = UDim2.new(0, 22, 0, 22),
+			BackgroundTransparency = 1,
+			Image = GetIcon("x") or "",
+			ZIndex = 4,
+			Theme = { ImageColor3 = "SubText" },
+			Parent = inner,
+		})
+		close.MouseButton1Click:Connect(function() N:Close() end)
+	end
+
+	Spring(card, { Position = UDim2.new(0, 0, 0, 0) }, 2.6, 0.72)
+	if bar then
+		Tween(bar, TweenInfo.new(duration, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 1, 0) })
+		task.delay(duration, function() N:Close() end)
+	end
+	return N
+end
+
+--------------------------------------------------------------------------
+-- 颜色工具
+--------------------------------------------------------------------------
+local NamedColors = {
+	Red = RGB(239, 68, 68), Orange = RGB(249, 115, 22), Yellow = RGB(234, 179, 8),
+	Green = RGB(34, 197, 94), Blue = RGB(59, 130, 246), Purple = RGB(168, 85, 247),
+	Pink = RGB(236, 72, 153), Grey = RGB(120, 120, 130), Gray = RGB(120, 120, 130), White = WHITE,
+}
+
+local function ResolveColor(c)
+	if c == nil then return nil end
+	if NamedColors[c] then return NamedColors[c] end
+	return ToColor(c, nil)
+end
+
+local function ColorToHex(c)
+	return string.format("%02X%02X%02X",
+		math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+local function ToHSV(c)
+	local r, g, b = c.R, c.G, c.B
+	local mx, mn = math.max(r, g, b), math.min(r, g, b)
+	local d = mx - mn
+	local h = 0
+	if d > 0 then
+		if mx == r then h = ((g - b) / d) % 6
+		elseif mx == g then h = (b - r) / d + 2
+		else h = (r - g) / d + 4 end
+		h = h / 6
+	end
+	local s = mx > 0 and d / mx or 0
+	return h, s, mx
+end
+
+local function IsLucide(icon)
+	if type(icon) ~= "string" then return false end
+	local name = icon:gsub("^lucide[%-:]", ""):lower()
+	return IconMap[name] ~= nil
+end
+
+--------------------------------------------------------------------------
+-- 元素宿主 (Tab / SubTab / Section / Group 共用的元素方法)
+--------------------------------------------------------------------------
+local HostMethods = {}
+local HostMT = { __index = HostMethods }
+local Elements = {}
+
+local function NewHost(window, tab, container, obj)
+	local h = setmetatable(obj or {}, HostMT)
+	h.Window = window
+	h.Tab = tab or h
+	h.Container = container
+	h._order = 0
+	return h
+end
+
+function HostMethods:_Order()
+	self._order = self._order + 1
+	return self._order
+end
+
+function HostMethods:_Added() end
+
+local function NormalizeArgs(a, b)
+	local cfg
+	if type(a) == "table" then
+		cfg = a
+	elseif type(b) == "table" then
+		cfg = b
+		if cfg.Flag == nil and a ~= nil then cfg.Flag = a end
+	elseif a ~= nil then
+		cfg = { Title = tostring(a) }
+	else
+		cfg = {}
+	end
+	if cfg.Title == nil then cfg.Title = cfg.Name end
+	if cfg.Desc == nil then cfg.Desc = cfg.Description or cfg.Content end
+	if cfg.Value == nil and cfg.Default ~= nil then cfg.Value = cfg.Default end
+	return cfg
+end
+
+--------------------------------------------------------------------------
+-- 元素基座: 玻璃卡片 + 标题/描述 + 右侧控件区 + 锁定遮罩
+--------------------------------------------------------------------------
+local function ElementBase(host, cfg, opt)
+	opt = opt or {}
+	local window, tab = host.Window, host.Tab
+	local state = { Hover = false, Press = false }
+	local tint = ResolveColor(cfg.Color)
+	local E = {
+		__type = opt.Type, Type = opt.Type,
+		Title = cfg.Title, Desc = cfg.Desc,
+		Locked = false, Visible = true,
+		Window = window, Tab = tab, Parent = host,
+		Callback = cfg.Callback,
+		UIElements = {},
+	}
+
+	local root = Create("Frame", {
+		Name = opt.Type or "Element",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = host:_Order(),
+		Theme = {
+			-- Active: 开关打开等 "激活" 状态时卡片染上主题色微光
+			BackgroundColor3 = function(th)
+				if state.Active then return th.Accent end
+				return tint or th.Element
+			end,
+			BackgroundTransparency = function(th)
+				local base = state.Active and th.ActiveT or (tint and 0.78 or th.ElementT)
+				if state.Press then return base - th.HoverDelta * 1.8 end
+				if state.Hover then return base - th.HoverDelta end
+				return base
+			end,
+		},
+		Parent = host.Container,
+	})
+	Corner(12, root)
+	local stroke = Rim(root, function(th)
+		local t = th.ElementStrokeT
+		if state.Active then t = t - 0.2 end
+		if state.Hover then t = t - 0.24 end
+		return math.max(t, 0)
+	end)
+	List(root, 0)
+
+	-- 标题区: 外层 header 为固定高度 (跟随内部自动高度的 inner),
+	-- 覆盖层 / 图标块 / 右侧控件都挂在 header 上, 不参与自动高度计算
+	local header = Create("Frame", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundTransparency = 1,
+		LayoutOrder = 1,
+		Parent = root,
+	})
+	local inner = Create("Frame", {
+		Name = "Inner",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = header,
+	})
+	Padding(13, 13, 14, 14, inner)
+	Create("Frame", { Name = "MinHeight", Size = UDim2.new(0, 0, 0, opt.MinHeight or 18), BackgroundTransparency = 1, Parent = inner })
+	FollowHeight(header, inner)
+
+	-- 特效层 (水波纹 / 悬停柔光), 铺满标题区并裁剪, 位于文字下方
+	local fx = Create("Frame", {
+		Name = "FX",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		ZIndex = 1,
+		Parent = header,
+	})
+
+	local iconOff = 0
+	local iconSrc = cfg.Icon or (opt.Type == "Paragraph" and cfg.Image) or nil
+	local iconImg
+	if iconSrc and GetIcon(iconSrc) then
+		if IsLucide(iconSrc) then
+			-- iOS 设置页风格的彩色图标块
+			local chipColor = ResolveColor(cfg.IconColor)
+			local chip = Create("Frame", {
+				Name = "IconChip",
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.new(0, 14, 0.5, 0),
+				Size = UDim2.new(0, 30, 0, 30),
+				BackgroundColor3 = chipColor or WHITE,
+				ZIndex = 2,
+				Parent = header,
+			})
+			Corner(9, chip)
+			if not chipColor then
+				local g = Create("UIGradient", { Rotation = 45, Parent = chip })
+				Bind(g, { Color = AccentSequence })
+			end
+			Create("Frame", {
+				Name = "Gloss",
+				Size = UDim2.new(1, 0, 0.5, 0),
+				BackgroundColor3 = WHITE,
+				BackgroundTransparency = 0.82,
+				BorderSizePixel = 0,
+				ZIndex = 2,
+				Parent = chip,
+			}, {
+				Create("UIGradient", { Rotation = 90, Transparency = NS({ { 0, 0 }, { 1, 1 } }) }),
+			})
+			Corner(9, chip:FindFirstChild("Gloss"))
+			iconImg = IconImage(iconSrc, 17, {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new(0.5, 0, 0.5, 0),
+				ZIndex = 3,
+				Theme = { ImageColor3 = chipColor and function() return WHITE end or "OnAccent" },
+				Parent = chip,
+			})
+			iconOff = 42
+		else
+			local size = cfg.ImageSize or cfg.IconSize or 20
+			if type(size) ~= "number" then size = 20 end
+			size = math.min(size, 48)
+			iconImg = Create("ImageLabel", {
+				Name = "Icon",
+				Image = GetIcon(iconSrc) or "",
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.new(0, 14, 0.5, 0),
+				Size = UDim2.new(0, size, 0, size),
+				BackgroundTransparency = 1,
+				ZIndex = 2,
+				Parent = header,
+			})
+			Corner(8, iconImg)
+			iconOff = size + 12
+		end
+	end
+
+	local right = opt.Right or 0
+	local labels = Create("Frame", {
+		Name = "Labels",
+		Position = UDim2.new(0, iconOff, 0, 0),
+		Size = UDim2.new(1, -(iconOff + right + (right > 0 and 14 or 0)), 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = inner,
+	})
+	List(labels, 3)
+	local title = Text({
+		Name = "Title",
+		Text = cfg.Title or "",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		Visible = cfg.Title ~= nil and cfg.Title ~= "",
+		LayoutOrder = 1,
+		Parent = labels,
+	})
+	local desc = Text({
+		Name = "Desc",
+		Text = cfg.Desc and tostring(cfg.Desc) or "",
+		TextSize = 13,
+		Font = "Regular",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		Visible = cfg.Desc ~= nil and cfg.Desc ~= "",
+		LayoutOrder = 2,
+		Theme = { TextColor3 = "SubText" },
+		Parent = labels,
+	})
+
+	local control
+	if right > 0 then
+		control = Create("Frame", {
+			Name = "Control",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, -14, 0.5, 0),
+			Size = UDim2.new(0, right, 0, opt.ControlHeight or 28),
+			BackgroundTransparency = 1,
+			ZIndex = 4,
+			Parent = header,
+		})
+	end
+
+	local click
+	if opt.Clickable then
+		click = Create("TextButton", {
+			Name = "Click",
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 3,
+			Parent = header,
+		})
+		click.MouseButton1Down:Connect(function()
+			if E.Locked then return end
+			state.Press = true
+			Restyle(root, 7)
+			Ripple(fx)
+		end)
+		local function up()
+			if state.Press then
+				state.Press = false
+				Restyle(root, 4)
+			end
+		end
+		click.MouseButton1Up:Connect(up)
+		click.MouseLeave:Connect(up)
+	end
+
+	root.MouseEnter:Connect(function()
+		state.Hover = true
+		Restyle(root, 6)
+		Restyle(stroke, 6)
+	end)
+	root.MouseLeave:Connect(function()
+		state.Hover = false
+		state.Press = false
+		Restyle(root, 4)
+		Restyle(stroke, 4)
+	end)
+
+	-- 锁定遮罩
+	local lock = Create("TextButton", {
+		Name = "Lock",
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 20,
+		Visible = false,
+		Theme = { BackgroundColor3 = "Glass" },
+		Parent = header,
+	})
+	Corner(12, lock)
+	local lockRow = Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		Size = UDim2.new(0, 0, 0, 20),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		ZIndex = 21,
+		Parent = lock,
+	})
+	List(lockRow, 6, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+	local lockIcon = IconImage("lock", 15, { ZIndex = 21, ImageTransparency = 1, LayoutOrder = 1, Theme = { ImageColor3 = "Text" }, Parent = lockRow })
+	local lockText = Text({
+		Name = "Reason", Text = "", TextSize = 12, ZIndex = 21, TextTransparency = 1, LayoutOrder = 2,
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 1, 0), Parent = lockRow,
+	})
+
+	E.ElementFrame = root
+	E.UIElements.Main = root
+	E.UIElements.Header = header
+	E.UIElements.Title = title
+	E.UIElements.Desc = desc
+
+	function E:SetTitle(t)
+		E.Title = t
+		title.Text = t and tostring(t) or ""
+		title.Visible = t ~= nil and t ~= ""
+	end
+
+	function E:SetDesc(d)
+		E.Desc = d
+		desc.Text = d and tostring(d) or ""
+		desc.Visible = d ~= nil and d ~= ""
+	end
+	E.SetDescription = E.SetDesc
+	E.SetContent = E.SetDesc
+
+	function E:Lock(reason)
+		E.Locked = true
+		if E._OnLock then E._OnLock() end
+		lockText.Text = reason or cfg.LockedTitle or ""
+		lock.Visible = true
+		Spring(lock, { BackgroundTransparency = 0.42 }, 4, 1)
+		Spring(lockIcon, { ImageTransparency = 0.1 }, 4, 1)
+		Spring(lockText, { TextTransparency = 0.1 }, 4, 1)
+	end
+
+	function E:Unlock()
+		E.Locked = false
+		Spring(lock, { BackgroundTransparency = 1 }, 4, 1)
+		Spring(lockIcon, { ImageTransparency = 1 }, 4, 1)
+		Spring(lockText, { TextTransparency = 1 }, 4, 1)
+		task.delay(0.35, function()
+			if not E.Locked then lock.Visible = false end
+		end)
+	end
+
+	function E:SetVisible(v)
+		E.Visible = v and true or false
+		root.Visible = E.Visible
+	end
+
+	function E:Highlight()
+		Set(stroke, { Color = WindUI.Theme.Accent, Transparency = 0 })
+		task.delay(0.15, function() Restyle(stroke, 1.2) end)
+	end
+
+	function E:Destroy()
+		root:Destroy()
+		local i = Find(tab.Elements, E)
+		if i then table.remove(tab.Elements, i) end
+		i = Find(window.AllElements, E)
+		if i then table.remove(window.AllElements, i) end
+		if E.Flag then
+			window.Flags[E.Flag] = nil
+			if WindUI.Options[E.Flag] == E then WindUI.Options[E.Flag] = nil end
+		end
+	end
+
+	function E:GetValue() return E.Value end
+	E.Get = E.GetValue
+
+	function E:OnChanged(fn)
+		E.Changed = fn
+		SafeCall(fn, E.Value)
+	end
+
+	function E._Fire(...)
+		SafeCall(E.Callback, ...)
+		SafeCall(E.Changed, ...)
+	end
+
+	function E._SetActive(on, instant)
+		state.Active = on and true or false
+		Restyle(root, instant and 60 or 3.5)
+		Restyle(stroke, instant and 60 or 3.5)
+	end
+
+	table.insert(tab.Elements, E)
+	table.insert(window.AllElements, E)
+
+	return E, {
+		Root = root, Header = header, Labels = labels, Title = title, Desc = desc,
+		Control = control, Click = click, Stroke = stroke, State = state, Icon = iconImg,
+	}
+end
+
+local function Finalize(E, cfg, host)
+	local w = host.Window
+	if cfg.Flag then
+		E.Flag = cfg.Flag
+		w.Flags[cfg.Flag] = E
+		WindUI.Options[cfg.Flag] = E
+	end
+	if cfg.Locked then E:Lock(cfg.LockedTitle) end
+	if cfg.Tooltip then Tooltip.Attach(E.ElementFrame, cfg.Tooltip) end
+	if cfg.Visible == false then E:SetVisible(false) end
+	host:_Added(E)
+	return E
+end
+
+-- 展开区 (下拉菜单 / 调色板 / 文本域 ...)
+local function MakeBody(root, autoSize)
+	local body = Create("Frame", {
+		Name = "Body",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = autoSize and Enum.AutomaticSize.Y or Enum.AutomaticSize.None,
+		ClipsDescendants = not autoSize,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+		Parent = root,
+	})
+	return body
+end
+
+local function Field(parent, props)
+	local p = {
+		Name = "Field",
+		Theme = { BackgroundColor3 = "Field", BackgroundTransparency = "FieldT" },
+		Parent = parent,
+	}
+	for k, v in pairs(props or {}) do p[k] = v end
+	local f = Create("Frame", p)
+	Corner(9, f)
+	return f
+end
+
+local function AccentFill(parent, props)
+	local p = { BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = parent }
+	for k, v in pairs(props or {}) do p[k] = v end
+	local f = Create("Frame", p)
+	local g = Create("UIGradient", { Parent = f })
+	Bind(g, { Color = AccentSequence })
+	return f, g
+end
+
+--------------------------------------------------------------------------
+-- Toggle / Checkbox
+--------------------------------------------------------------------------
+function Elements.Toggle(host, cfg)
+	local checkbox = cfg.Type == "Checkbox"
+	local E, B = ElementBase(host, cfg, { Type = "Toggle", Right = checkbox and 26 or 48, Clickable = true })
+	E.Value = cfg.Value and true or false
+
+	local render
+	if checkbox then
+		local box = Create("Frame", {
+			Name = "Checkbox",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, 0, 0.5, 0),
+			Size = UDim2.new(0, 24, 0, 24),
+			Theme = {
+				BackgroundColor3 = function(th) return E.Value and th.Accent or th.Track end,
+				BackgroundTransparency = function(th) return E.Value and 0 or th.TrackT end,
+			},
+			Parent = B.Control,
+		})
+		Corner(7, box)
+		Rim(box, "ElementStrokeT")
+		local check = IconImage("check", 16, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), ZIndex = 4,
+			Theme = { ImageColor3 = "OnAccent" }, Parent = box,
+		})
+		local scale = Create("UIScale", { Scale = E.Value and 1 or 0, Parent = check })
+		render = function(animate)
+			if animate then
+				Restyle(box, 5)
+				Spring(scale, { Scale = E.Value and 1 or 0 }, 4.5, 0.5)
+			else
+				Restyle(box, 50)
+				Set(scale, { Scale = E.Value and 1 or 0 })
+			end
+		end
+	else
+		local track = Create("Frame", {
+			Name = "Track",
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, 0, 0.5, 0),
+			Size = UDim2.new(0, 46, 0, 26),
+			Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+			Parent = B.Control,
+		})
+		Corner(UDim.new(1, 0), track)
+		Rim(track, "ElementStrokeT")
+		local fill = AccentFill(track, { Name = "Fill", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = E.Value and 0 or 1, ZIndex = 2 })
+		Corner(UDim.new(1, 0), fill)
+		local knob = Create("Frame", {
+			Name = "Knob",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0, E.Value and 33 or 13, 0.5, 0),
+			Size = UDim2.new(0, 20, 0, 20),
+			BackgroundColor3 = WHITE,
+			ZIndex = 4,
+			Parent = track,
+		})
+		Corner(UDim.new(1, 0), knob)
+		Create("UIStroke", { Color = BLACK, Transparency = 0.86, Thickness = 1, Parent = knob })
+		Create("UIGradient", {
+			Rotation = 90,
+			Color = CS({ { 0, WHITE }, { 1, RGB(222, 228, 240) } }),
+			Parent = knob,
+		})
+		B.Click.MouseButton1Down:Connect(function()
+			if E.Locked then return end
+			Spring(knob, { Size = UDim2.new(0, 25, 0, 20) }, 6, 1)
+		end)
+		render = function(animate)
+			local x = E.Value and 33 or 13
+			if animate then
+				Spring(fill, { BackgroundTransparency = E.Value and 0 or 1 }, 4, 1)
+				Spring(knob, { Size = UDim2.new(0, 26, 0, 20) }, 8, 1)
+				Spring(knob, { Position = UDim2.new(0, x, 0.5, 0) }, 3.2, 0.6)
+				task.delay(0.12, function()
+					Spring(knob, { Size = UDim2.new(0, 20, 0, 20) }, 3.6, 0.45)
+				end)
+			else
+				Set(fill, { BackgroundTransparency = E.Value and 0 or 1 })
+				Set(knob, { Position = UDim2.new(0, x, 0.5, 0), Size = UDim2.new(0, 20, 0, 20) })
+			end
+		end
+	end
+
+	function E:Set(v, isCallback)
+		E.Value = v and true or false
+		render(true)
+		E._SetActive(E.Value)
+		if isCallback ~= false then E._Fire(E.Value) end
+	end
+	E.SetValue = E.Set
+
+	B.Click.MouseButton1Click:Connect(function()
+		if E.Locked then return end
+		E:Set(not E.Value)
+	end)
+
+	render(false)
+	E._SetActive(E.Value, true)
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Slider
+--------------------------------------------------------------------------
+function Elements.Slider(host, cfg)
+	local v = cfg.Value
+	local min, max, def
+	if type(v) == "table" then
+		min, max, def = v.Min, v.Max, v.Default
+	else
+		min, max, def = cfg.Min, cfg.Max, v
+	end
+	min = tonumber(min) or 0
+	max = tonumber(max) or 100
+	if max <= min then max = min + 1 end
+	def = tonumber(def) or min
+
+	local step = tonumber(cfg.Step)
+	local decimals = 0
+	if cfg.Rounding and not step then
+		decimals = cfg.Rounding
+		step = 10 ^ (-decimals)
+	end
+	step = step or 1
+	if decimals == 0 then
+		local s = tostring(step)
+		local dot = s:find("%.")
+		if dot then decimals = #s - dot end
+	end
+
+	local showBox = cfg.IsTextbox ~= false
+	local width = cfg.Width or 200
+	local E, B = ElementBase(host, cfg, { Type = "Slider", Right = width, ControlHeight = 28 })
+	E.Value = { Min = min, Max = max, Default = def }
+	E.Step = step
+
+	local function fmt(x)
+		return string.format("%." .. decimals .. "f", x)
+	end
+	local function quantize(x)
+		x = math.clamp(x, min, max)
+		x = min + math.floor((x - min) / step + 0.5) * step
+		return tonumber(fmt(math.clamp(x, min, max)))
+	end
+	E.Value.Default = quantize(def)
+
+	local boxW = showBox and 48 or 0
+	local area = Create("TextButton", {
+		Name = "Area",
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -(boxW + (showBox and 12 or 0)), 1, 0),
+		Position = UDim2.new(0, 6, 0, 0),
+		Parent = B.Control,
+	})
+	local track = Create("Frame", {
+		Name = "Track",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.new(1, 0, 0, 6),
+		Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+		Parent = area,
+	})
+	Corner(UDim.new(1, 0), track)
+	local fill = AccentFill(track, { Name = "Fill", Size = UDim2.new(0, 0, 1, 0), ZIndex = 2 })
+	Corner(UDim.new(1, 0), fill)
+	local knob = Create("Frame", {
+		Name = "Knob",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.new(0, 16, 0, 16),
+		BackgroundColor3 = WHITE,
+		ZIndex = 4,
+		Parent = area,
+	})
+	Corner(UDim.new(1, 0), knob)
+	local knobRing = Create("UIStroke", { Thickness = 2, Transparency = 0.4, Theme = { Color = "Accent" }, Parent = knob })
+
+	local tip, tipLabel
+	if cfg.IsTooltip then
+		tip = Create("Frame", {
+			Name = "Tooltip",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 0, -6),
+			Size = UDim2.new(0, 0, 0, 22),
+			AutomaticSize = Enum.AutomaticSize.X,
+			Visible = false,
+			ZIndex = 8,
+			Theme = { BackgroundColor3 = "Accent" },
+			Parent = knob,
+		})
+		Corner(7, tip)
+		Padding(0, 0, 8, 8, tip)
+		tipLabel = Text({ Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, TextSize = 12, Font = "SemiBold", ZIndex = 9, Theme = { TextColor3 = "OnAccent" }, Parent = tip })
+	end
+
+	local box, boxFocused = nil, false
+	if showBox then
+		local holder = Field(B.Control, {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, 0, 0.5, 0),
+			Size = UDim2.new(0, boxW, 0, 26),
+		})
+		box = Create("TextBox", {
+			Name = "Value",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			Text = fmt(E.Value.Default),
+			ClearTextOnFocus = false,
+			Font = "SemiBold",
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Theme = { TextColor3 = "Text" },
+			Parent = holder,
+		})
+		box.Focused:Connect(function() boxFocused = true end)
+	end
+
+	local function render(instant)
+		local p = (E.Value.Default - min) / (max - min)
+		if instant then
+			Set(fill, { Size = UDim2.new(p, 0, 1, 0) })
+			Set(knob, { Position = UDim2.new(p, 0, 0.5, 0) })
+		else
+			Spring(fill, { Size = UDim2.new(p, 0, 1, 0) }, 6, 0.9)
+			Spring(knob, { Position = UDim2.new(p, 0, 0.5, 0) }, 6, 0.9)
+		end
+		if box and not boxFocused then box.Text = fmt(E.Value.Default) end
+		if tipLabel then tipLabel.Text = fmt(E.Value.Default) end
+	end
+
+	function E:Set(x)
+		x = tonumber(x)
+		if not x then return end
+		E.Value.Default = quantize(x)
+		render(false)
+		E._Fire(E.Value.Default)
+	end
+	E.SetValue = E.Set
+
+	function E:GetValue() return E.Value.Default end
+	E.Get = E.GetValue
+
+	function E:SetMin(m)
+		min = tonumber(m) or min
+		E.Value.Min = min
+		E:Set(E.Value.Default)
+	end
+
+	function E:SetMax(m)
+		max = tonumber(m) or max
+		E.Value.Max = max
+		E:Set(E.Value.Default)
+	end
+
+	function E:OnChanged(fn)
+		E.Changed = fn
+		SafeCall(fn, E.Value.Default)
+	end
+
+	if box then
+		box.FocusLost:Connect(function()
+			boxFocused = false
+			local n = tonumber(box.Text)
+			if n and not E.Locked then
+				E:Set(n)
+			else
+				box.Text = fmt(E.Value.Default)
+			end
+		end)
+	end
+
+	local function fromX(px)
+		local p = (px - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1)
+		local x = quantize(min + Clamp01(p) * (max - min))
+		if x ~= E.Value.Default then
+			E.Value.Default = x
+			render(false)
+			E._Fire(x)
+		end
+	end
+
+	OnDrag(area, function(input)
+		if E.Locked then return false end
+		Spring(knob, { Size = UDim2.new(0, 22, 0, 22) }, 5, 0.55)
+		Spring(track, { Size = UDim2.new(1, 0, 0, 8) }, 5, 1)
+		Spring(knobRing, { Transparency = 0 }, 5, 1)
+		if tip then tip.Visible = true end
+		fromX(input.Position.X)
+	end, function(input)
+		fromX(input.Position.X)
+	end, function()
+		Spring(knob, { Size = UDim2.new(0, 16, 0, 16) }, 4, 0.5)
+		Spring(track, { Size = UDim2.new(1, 0, 0, 6) }, 5, 1)
+		Spring(knobRing, { Transparency = 0.4 }, 5, 1)
+		if tip then tip.Visible = false end
+	end)
+
+	render(true)
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Dropdown (单选 / 多选 / 搜索)
+--------------------------------------------------------------------------
+local function ItemKey(item)
+	if type(item) == "table" then return tostring(item.Title or item.Name or item.Value or "") end
+	return tostring(item)
+end
+
+function Elements.Dropdown(host, cfg)
+	local width = math.clamp(cfg.MenuWidth or 170, 120, 240)
+	local E, B = ElementBase(host, cfg, { Type = "Dropdown", Right = width, Clickable = true })
+	E.Values = cfg.Values or {}
+	E.Multi = cfg.Multi and true or false
+	E.AllowNone = cfg.AllowNone
+	E.Opened = false
+
+	local function normalize(val)
+		if E.Multi then
+			local out = {}
+			if type(val) == "table" and val.Title == nil then
+				if #val > 0 then
+					for _, x in ipairs(val) do table.insert(out, x) end
+				else
+					for k, on in pairs(val) do
+						if on == true then table.insert(out, k) end
+					end
+				end
+			elseif val ~= nil then
+				table.insert(out, val)
+			end
+			return out
+		end
+		if type(val) == "number" and E.Values[val] ~= nil then return E.Values[val] end
+		return val
+	end
+	E.Value = normalize(cfg.Value)
+
+	local function isSelected(item)
+		local k = ItemKey(item)
+		if E.Multi then
+			for _, x in ipairs(E.Value) do
+				if ItemKey(x) == k then return true end
+			end
+			return false
+		end
+		return E.Value ~= nil and ItemKey(E.Value) == k
+	end
+
+	local function displayText()
+		if E.Multi then
+			if #E.Value == 0 then return "--" end
+			local t = {}
+			for _, x in ipairs(E.Value) do table.insert(t, ItemKey(x)) end
+			return table.concat(t, ", ")
+		end
+		if E.Value == nil then return "--" end
+		return ItemKey(E.Value)
+	end
+
+	local field = Field(B.Control, { Size = UDim2.new(1, 0, 1, 0) })
+	Rim(field, "ElementStrokeT")
+	local display = Text({
+		Name = "Display",
+		Text = displayText(),
+		TextSize = 13,
+		Position = UDim2.new(0, 10, 0, 0),
+		Size = UDim2.new(1, -36, 1, 0),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = field,
+	})
+	local chevron = IconImage("chevron-down", 16, {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+		Theme = { ImageColor3 = "SubText" }, Parent = field,
+	})
+
+	local body = MakeBody(B.Root, false)
+	local menu = Create("Frame", {
+		Name = "Menu",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Parent = body,
+	})
+	Padding(0, 10, 10, 10, menu)
+	Create("Frame", {
+		Name = "Line",
+		Size = UDim2.new(1, 0, 0, 1),
+		Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+		BorderSizePixel = 0,
+		Parent = menu,
+	})
+
+	local searchH = 0
+	local searchBox
+	if cfg.SearchBarEnabled or #E.Values > 8 then
+		searchH = 38
+		local sf = Field(menu, { Position = UDim2.new(0, 0, 0, 7), Size = UDim2.new(1, 0, 0, 28) })
+		IconImage("search", 14, {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 9, 0.5, 0),
+			Theme = { ImageColor3 = "Placeholder" }, Parent = sf,
+		})
+		searchBox = Create("TextBox", {
+			Name = "Search",
+			Text = "",
+			PlaceholderText = "Search...",
+			ClearTextOnFocus = false,
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 30, 0, 0),
+			Size = UDim2.new(1, -36, 1, 0),
+			TextSize = 13,
+			Font = "Regular",
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Theme = { TextColor3 = "Text", PlaceholderColor3 = "Placeholder" },
+			Parent = sf,
+		})
+	end
+
+	local list = Create("ScrollingFrame", {
+		Name = "List",
+		Position = UDim2.new(0, 0, 0, searchH + 6),
+		Size = UDim2.new(1, 0, 0, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Theme = { ScrollBarImageColor3 = "SubText" },
+		Parent = menu,
+	})
+	List(list, 2)
+
+	local items = {}
+	local function listHeight()
+		local n = 0
+		for _, it in ipairs(items) do
+			if it.Button.Visible then n = n + 1 end
+		end
+		return math.max(math.min(n * 34, 238), 30)
+	end
+
+	local function restyleItems()
+		for _, it in ipairs(items) do
+			Restyle(it.Button, 6)
+			Spring(it.Check, { ImageTransparency = isSelected(it.Item) and 0 or 1 }, 6, 1)
+		end
+		display.Text = displayText()
+	end
+
+	local function resize()
+		local lh = listHeight()
+		list.Size = UDim2.new(1, 0, 0, lh)
+		if E.Opened then
+			Spring(body, { Size = UDim2.new(1, 0, 0, lh + searchH + 16) }, 4.2, 0.8)
+		end
+	end
+
+	function E:Open()
+		if E.Locked then return end
+		E.Opened = true
+		resize()
+		Spring(chevron, { Rotation = 180 }, 4.5, 0.65)
+	end
+
+	function E:Close()
+		E.Opened = false
+		Spring(body, { Size = UDim2.new(1, 0, 0, 0) }, 4.5, 1)
+		Spring(chevron, { Rotation = 0 }, 4.5, 0.65)
+	end
+	E._OnLock = function() E:Close() end
+
+	local function choose(item)
+		if E.Locked then return end
+		if E.Multi then
+			local idx
+			for i, x in ipairs(E.Value) do
+				if ItemKey(x) == ItemKey(item) then idx = i end
+			end
+			if idx then
+				if #E.Value > 1 or E.AllowNone then table.remove(E.Value, idx) end
+			else
+				table.insert(E.Value, item)
+			end
+		else
+			if E.Value ~= nil and ItemKey(E.Value) == ItemKey(item) then
+				if E.AllowNone then E.Value = nil end
+			else
+				E.Value = item
+			end
+			E:Close()
+		end
+		restyleItems()
+		if type(item) == "table" and item.Callback then SafeCall(item.Callback, item) end
+		E._Fire(E.Value)
+	end
+
+	local function build()
+		for _, it in ipairs(items) do it.Button:Destroy() end
+		items = {}
+		for i, item in ipairs(E.Values) do
+			local st = { Hover = false }
+			local btn = Create("TextButton", {
+				Name = "Option",
+				Text = "",
+				AutoButtonColor = false,
+				Size = UDim2.new(1, 0, 0, 32),
+				LayoutOrder = i,
+				Theme = {
+					BackgroundColor3 = function(th) return isSelected(item) and th.Accent or th.Element end,
+					BackgroundTransparency = function(th)
+						if isSelected(item) then return th.SelectT end
+						return st.Hover and (th.Dark and 0.92 or 0.5) or 1
+					end,
+				},
+				Parent = list,
+			})
+			Corner(8, btn)
+			local off = 10
+			if type(item) == "table" and item.Icon and GetIcon(item.Icon) then
+				IconImage(item.Icon, 16, { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Parent = btn })
+				off = 34
+			end
+			Text({
+				Name = "Label",
+				Text = ItemKey(item),
+				TextSize = 13,
+				Position = UDim2.new(0, off, 0, 0),
+				Size = UDim2.new(1, -(off + 30), 1, 0),
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Parent = btn,
+			})
+			local check = IconImage("check", 15, {
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0),
+				ImageTransparency = isSelected(item) and 0 or 1,
+				Theme = { ImageColor3 = "Accent" }, Parent = btn,
+			})
+			btn.MouseEnter:Connect(function() st.Hover = true Restyle(btn, 7) end)
+			btn.MouseLeave:Connect(function() st.Hover = false Restyle(btn, 5) end)
+			btn.MouseButton1Click:Connect(function() choose(item) end)
+			if type(item) == "table" and item.Locked then
+				btn.Active = false
+				btn.AutoButtonColor = false
+			end
+			table.insert(items, { Button = btn, Check = check, Item = item })
+		end
+		if searchBox then searchBox.Text = "" end
+		restyleItems()
+		resize()
+	end
+
+	if searchBox then
+		searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+			local q = searchBox.Text:lower()
+			for _, it in ipairs(items) do
+				it.Button.Visible = q == "" or ItemKey(it.Item):lower():find(q, 1, true) ~= nil
+			end
+			resize()
+		end)
+	end
+
+	B.Click.MouseButton1Click:Connect(function()
+		if E.Locked then return end
+		if E.Opened then E:Close() else E:Open() end
+	end)
+
+	function E:Refresh(values)
+		E.Values = values or E.Values
+		if E.Multi then
+			local keep = {}
+			for _, x in ipairs(E.Value) do
+				for _, nv in ipairs(E.Values) do
+					if ItemKey(nv) == ItemKey(x) then table.insert(keep, nv) break end
+				end
+			end
+			E.Value = keep
+		elseif E.Value ~= nil then
+			local found
+			for _, nv in ipairs(E.Values) do
+				if ItemKey(nv) == ItemKey(E.Value) then found = nv break end
+			end
+			E.Value = found
+		end
+		build()
+	end
+	function E:SetValues(values) E:Refresh(values) end
+
+	function E:Select(val)
+		E.Value = normalize(val)
+		restyleItems()
+		E._Fire(E.Value)
+	end
+	E.Set = E.Select
+	E.SetValue = E.Select
+
+	build()
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Input / Textarea
+--------------------------------------------------------------------------
+function Elements.Input(host, cfg)
+	local area = cfg.Type == "Textarea"
+	local E, B = ElementBase(host, cfg, { Type = "Input", Right = area and 0 or (cfg.Width or 180) })
+	E.Value = tostring(cfg.Value or "")
+	local focused = false
+
+	local parent
+	if area then
+		local body = MakeBody(B.Root, true)
+		Padding(0, 12, 14, 14, body)
+		parent = body
+	end
+	local field = Field(parent or B.Control, { Size = area and UDim2.new(1, 0, 0, cfg.Height or 96) or UDim2.new(1, 0, 1, 0) })
+	local focusStroke = Create("UIStroke", {
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Thickness = 1.5,
+		Theme = {
+			Color = "Accent",
+			Transparency = function() return focused and 0.1 or 1 end,
+		},
+		Parent = field,
+	})
+
+	local off = 10
+	if cfg.InputIcon and GetIcon(cfg.InputIcon) then
+		IconImage(cfg.InputIcon, 15, {
+			AnchorPoint = Vector2.new(0, area and 0 or 0.5), Position = UDim2.new(0, 9, area and 0 or 0.5, area and 9 or 0),
+			Theme = { ImageColor3 = "Placeholder" }, Parent = field,
+		})
+		off = 30
+	end
+	local box = Create("TextBox", {
+		Name = "Input",
+		Text = E.Value,
+		PlaceholderText = cfg.Placeholder or "",
+		ClearTextOnFocus = cfg.ClearTextOnFocus or false,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, off, 0, area and 8 or 0),
+		Size = UDim2.new(1, -(off + 10), 1, area and -16 or 0),
+		TextSize = 13,
+		Font = "Regular",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = area and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		MultiLine = area,
+		TextWrapped = area,
+		Theme = { TextColor3 = "Text", PlaceholderColor3 = "Placeholder" },
+		Parent = field,
+	})
+	if not area then box.TextTruncate = Enum.TextTruncate.AtEnd end
+
+	local function commit(t)
+		if cfg.MaxLength and #t > cfg.MaxLength then t = t:sub(1, cfg.MaxLength) end
+		if cfg.Numeric and t ~= "" and not tonumber(t) then
+			box.Text = E.Value
+			return
+		end
+		E.Value = t
+		E._Fire(t)
+	end
+
+	box.Focused:Connect(function()
+		if E.Locked then box:ReleaseFocus() return end
+		focused = true
+		Restyle(focusStroke, 6)
+	end)
+	box.FocusLost:Connect(function()
+		focused = false
+		Restyle(focusStroke, 4)
+		if E.Locked then box.Text = E.Value return end
+		if box.Text ~= E.Value or cfg.Finished then commit(box.Text) end
+	end)
+	if cfg.Finished == false then
+		box:GetPropertyChangedSignal("Text"):Connect(function()
+			if focused and box.Text ~= E.Value then commit(box.Text) end
+		end)
+	end
+
+	function E:Set(t)
+		t = t == nil and "" or tostring(t)
+		E.Value = t
+		box.Text = t
+		E._Fire(t)
+	end
+	E.SetValue = E.Set
+
+	function E:SetPlaceholder(p)
+		box.PlaceholderText = p or ""
+	end
+
+	E.UIElements.Input = box
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Keybind
+--------------------------------------------------------------------------
+local function KeyName(k)
+	if typeof(k) == "EnumItem" then return k.Name end
+	if type(k) == "string" and k ~= "" then return k end
+	return "F"
+end
+
+function Elements.Keybind(host, cfg)
+	local E, B = ElementBase(host, cfg, { Type = "Keybind", Right = 96, Clickable = true })
+	E.Value = KeyName(cfg.Value)
+	E.Picking = false
+
+	local pill = Field(B.Control, {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0, 0, 0, 28),
+		AutomaticSize = Enum.AutomaticSize.X,
+		ZIndex = 3,
+	})
+	Padding(0, 0, 12, 12, pill)
+	local pillStroke = Rim(pill, function(th) return E.Picking and 0 or th.ElementStrokeT end)
+	local label = Text({
+		Name = "Key",
+		Text = E.Value,
+		Font = "SemiBold",
+		TextSize = 13,
+		Size = UDim2.new(0, 0, 1, 0),
+		AutomaticSize = Enum.AutomaticSize.X,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 3,
+		Parent = pill,
+	})
+
+	local function show()
+		label.Text = E.Picking and "..." or E.Value
+		Restyle(pillStroke, 6)
+	end
+
+	function E:Set(k)
+		E.Value = KeyName(k)
+		show()
+		SafeCall(cfg.ChangedCallback, E.Value)
+	end
+	E.SetValue = E.Set
+
+	B.Click.MouseButton1Click:Connect(function()
+		if E.Locked or E.Picking then return end
+		E.Picking = true
+		show()
+		task.wait(0.15)
+		local conn
+		conn = UserInputService.InputBegan:Connect(function(input)
+			local name
+			if input.UserInputType == Enum.UserInputType.Keyboard then
+				if input.KeyCode == Enum.KeyCode.Escape then
+					name = E.Value
+				else
+					name = input.KeyCode.Name
+				end
+			elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+				name = "MouseLeft"
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+				name = "MouseRight"
+			end
+			if name then
+				conn:Disconnect()
+				E.Picking = false
+				E:Set(name)
+			end
+		end)
+	end)
+
+	local conn
+	conn = Connect(UserInputService.InputBegan, function(input)
+		if not B.Root.Parent then conn:Disconnect() return end
+		if E.Picking or E.Locked or UserInputService:GetFocusedTextBox() then return end
+		local hit = (input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == E.Value)
+			or (E.Value == "MouseLeft" and input.UserInputType == Enum.UserInputType.MouseButton1)
+			or (E.Value == "MouseRight" and input.UserInputType == Enum.UserInputType.MouseButton2)
+		if hit then E._Fire(E.Value) end
+	end)
+
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Colorpicker (SV 面板 + 色相条 + 透明度条 + HEX)
+--------------------------------------------------------------------------
+local RAINBOW = (function()
+	local pts = {}
+	for i = 0, 6 do table.insert(pts, { i / 6, Color3.fromHSV((i % 6) / 6, 1, 1) }) end
+	return CS(pts)
+end)()
+
+function Elements.Colorpicker(host, cfg)
+	local E, B = ElementBase(host, cfg, { Type = "Colorpicker", Right = 46, Clickable = true })
+	local color = ToColor(cfg.Value or cfg.Default, RGB(96, 165, 250))
+	local transp = cfg.Transparency
+	local h, s, v = ToHSV(color)
+	E.Value = color
+	E.Transparency = transp
+	E.Opened = false
+
+	local swatch = Create("Frame", {
+		Name = "Swatch",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0, 42, 0, 26),
+		BackgroundColor3 = color,
+		BackgroundTransparency = transp or 0,
+		Parent = B.Control,
+	})
+	Corner(8, swatch)
+	Rim(swatch)
+
+	local PICK_H = 140
+	local body = MakeBody(B.Root, false)
+	local panel = Create("Frame", { Name = "Panel", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Parent = body })
+	Padding(2, 12, 14, 14, panel)
+
+	local sideW = transp ~= nil and 56 or 30
+	local sv = Create("TextButton", {
+		Name = "SV",
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.new(1, -sideW, 0, PICK_H),
+		BackgroundColor3 = Color3.fromHSV(h, 1, 1),
+		Parent = panel,
+	})
+	Corner(10, sv)
+	local white = Create("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = WHITE, Parent = sv }, {
+		Create("UIGradient", { Transparency = NS({ { 0, 0 }, { 1, 1 } }) }),
+	})
+	Corner(10, white)
+	local black = Create("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = BLACK, ZIndex = 2, Parent = sv }, {
+		Create("UIGradient", { Rotation = 90, Transparency = NS({ { 0, 1 }, { 1, 0 } }) }),
+	})
+	Corner(10, black)
+	local svCursor = Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.new(0, 14, 0, 14),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = sv,
+	})
+	Corner(UDim.new(1, 0), svCursor)
+	Create("UIStroke", { Color = WHITE, Thickness = 2, Parent = svCursor })
+
+	local function bar(name, xOff)
+		local b = Create("TextButton", {
+			Name = name,
+			Text = "",
+			AutoButtonColor = false,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, xOff, 0, 0),
+			Size = UDim2.new(0, 18, 0, PICK_H),
+			BackgroundColor3 = WHITE,
+			Parent = panel,
+		})
+		Corner(9, b)
+		local cur = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Size = UDim2.new(1, 4, 0, 6),
+			BackgroundTransparency = 1,
+			ZIndex = 5,
+			Parent = b,
+		})
+		Corner(3, cur)
+		Create("UIStroke", { Color = WHITE, Thickness = 2, Parent = cur })
+		return b, cur
+	end
+
+	local hue, hueCursor = bar("Hue", transp ~= nil and -26 or 0)
+	Create("UIGradient", { Rotation = 90, Color = RAINBOW, Parent = hue })
+	local alpha, alphaCursor, alphaGrad
+	if transp ~= nil then
+		alpha, alphaCursor = bar("Alpha", 0)
+		alphaGrad = Create("UIGradient", { Rotation = 90, Transparency = NS({ { 0, 0 }, { 1, 0.95 } }), Parent = alpha })
+	end
+
+	local row = Create("Frame", {
+		Name = "Row",
+		Position = UDim2.new(0, 0, 0, PICK_H + 10),
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundTransparency = 1,
+		Parent = panel,
+	})
+	List(row, 8, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+	local hexField = Field(row, { Size = UDim2.new(0, 96, 1, 0), LayoutOrder = 1 })
+	Text({ Text = "#", TextSize = 13, Position = UDim2.new(0, 9, 0, 0), Size = UDim2.new(0, 10, 1, 0), Theme = { TextColor3 = "Placeholder" }, Parent = hexField })
+	local hexBox = Create("TextBox", {
+		Name = "Hex",
+		Text = ColorToHex(color),
+		ClearTextOnFocus = false,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 20, 0, 0),
+		Size = UDim2.new(1, -24, 1, 0),
+		TextSize = 13,
+		Font = "SemiBold",
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Theme = { TextColor3 = "Text" },
+		Parent = hexField,
+	})
+	local rgbLabel = Text({
+		Name = "RGB", TextSize = 12, Font = "Regular", LayoutOrder = 2,
+		Size = UDim2.new(1, -104, 1, 0), Theme = { TextColor3 = "SubText" }, Parent = row,
+	})
+
+	local function update(fire)
+		color = Color3.fromHSV(h, s, v)
+		E.Value = color
+		E.Transparency = transp
+		sv.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+		swatch.BackgroundColor3 = color
+		swatch.BackgroundTransparency = transp or 0
+		svCursor.Position = UDim2.new(s, 0, 1 - v, 0)
+		hueCursor.Position = UDim2.new(0.5, 0, h, 0)
+		if alpha then
+			alpha.BackgroundColor3 = color
+			alphaCursor.Position = UDim2.new(0.5, 0, transp, 0)
+		end
+		hexBox.Text = ColorToHex(color)
+		rgbLabel.Text = string.format("RGB  %d, %d, %d%s",
+			math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5),
+			transp ~= nil and string.format("   A %d%%", math.floor((1 - transp) * 100 + 0.5)) or "")
+		if fire then E._Fire(color, transp) end
+	end
+
+	local function rel(gui, input)
+		local p, sz = gui.AbsolutePosition, gui.AbsoluteSize
+		return Clamp01((input.Position.X - p.X) / math.max(sz.X, 1)), Clamp01((input.Position.Y - p.Y) / math.max(sz.Y, 1))
+	end
+	local function svMove(input)
+		s, v = rel(sv, input)
+		v = 1 - v
+		update(true)
+	end
+	OnDrag(sv, function(i) if E.Locked then return false end svMove(i) end, svMove)
+	local function hueMove(input)
+		local _, y = rel(hue, input)
+		h = math.min(y, 0.999)
+		update(true)
+	end
+	OnDrag(hue, function(i) if E.Locked then return false end hueMove(i) end, hueMove)
+	if alpha then
+		local function alphaMove(input)
+			local _, y = rel(alpha, input)
+			transp = y
+			update(true)
+		end
+		OnDrag(alpha, function(i) if E.Locked then return false end alphaMove(i) end, alphaMove)
+	end
+
+	hexBox.FocusLost:Connect(function()
+		local txt = hexBox.Text:gsub("#", "")
+		local ok, c = pcall(Color3.fromHex, txt)
+		if ok and c and not E.Locked then
+			h, s, v = ToHSV(c)
+			update(true)
+		else
+			hexBox.Text = ColorToHex(color)
+		end
+	end)
+
+	function E:Open()
+		if E.Locked then return end
+		E.Opened = true
+		Spring(body, { Size = UDim2.new(1, 0, 0, PICK_H + 52) }, 4, 0.8)
+	end
+	function E:Close()
+		E.Opened = false
+		Spring(body, { Size = UDim2.new(1, 0, 0, 0) }, 4.5, 1)
+	end
+	E._OnLock = function() E:Close() end
+
+	B.Click.MouseButton1Click:Connect(function()
+		if E.Locked then return end
+		if E.Opened then E:Close() else E:Open() end
+	end)
+
+	function E:Update(c, t)
+		c = ToColor(c, color)
+		h, s, v = ToHSV(c)
+		if t ~= nil then transp = t end
+		update(true)
+	end
+	E.Set = E.Update
+	E.SetValue = E.Update
+	E.SetValueRGB = E.Update
+
+	update(false)
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Button
+--------------------------------------------------------------------------
+function Elements.Button(host, cfg)
+	local E, B = ElementBase(host, cfg, { Type = "Button", Right = 22, Clickable = true })
+	local arrow = IconImage(cfg.RightIcon or "chevron-right", 18, {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		Theme = { ImageColor3 = "SubText" }, Parent = B.Control,
+	})
+	B.Click.MouseButton1Click:Connect(function()
+		if E.Locked then return end
+		Set(arrow, { Position = UDim2.new(1, 5, 0.5, 0) })
+		Spring(arrow, { Position = UDim2.new(1, 0, 0.5, 0) }, 3.5, 0.4)
+		E:Highlight()
+		task.spawn(E._Fire)
+	end)
+	function E:Fire() E._Fire() end
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Paragraph (可带图片 / 缩略图 / 按钮组)
+--------------------------------------------------------------------------
+local function PillButton(parent, b, order)
+	local primary = b.Variant ~= "Secondary" and b.Variant ~= "Tertiary"
+	local btn = Create("TextButton", {
+		Name = "Button",
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.new(0, 0, 0, 32),
+		AutomaticSize = Enum.AutomaticSize.X,
+		LayoutOrder = order or 1,
+		Theme = {
+			-- 主按钮底色为白, 由子级渐变上色
+			BackgroundColor3 = primary and function() return WHITE end or "Element",
+			BackgroundTransparency = function(th)
+				if b.Variant == "Tertiary" then return 1 end
+				return primary and 0 or math.max(th.ElementT - 0.04, 0)
+			end,
+		},
+		Parent = parent,
+	})
+	Corner(10, btn)
+	if primary then
+		local g = Create("UIGradient", { Parent = btn })
+		Bind(g, { Color = AccentSequence })
+	else
+		Rim(btn, "ElementStrokeT")
+	end
+	Padding(0, 0, 14, 14, btn)
+	List(btn, 6, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+	if b.Icon and GetIcon(b.Icon) then
+		IconImage(b.Icon, 15, { LayoutOrder = 1, Theme = { ImageColor3 = primary and "OnAccent" or "Text" }, Parent = btn })
+	end
+	Text({
+		Text = b.Title or "Button", Font = "SemiBold", TextSize = 13, LayoutOrder = 2,
+		Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X,
+		Theme = { TextColor3 = primary and "OnAccent" or "Text" }, Parent = btn,
+	})
+	PressScale(btn)
+	return btn
+end
+
+function Elements.Paragraph(host, cfg)
+	local E, B = ElementBase(host, cfg, { Type = "Paragraph" })
+	if cfg.Thumbnail then
+		local thumb = Create("ImageLabel", {
+			Name = "Thumbnail",
+			Image = GetIcon(cfg.Thumbnail) or tostring(cfg.Thumbnail),
+			Size = UDim2.new(1, 0, 0, cfg.ThumbnailSize or 120),
+			BackgroundTransparency = 1,
+			ScaleType = Enum.ScaleType.Crop,
+			LayoutOrder = 0,
+			Parent = B.Root,
+		})
+		Corner(12, thumb)
+		E.UIElements.Thumbnail = thumb
+	end
+	if cfg.Buttons and #cfg.Buttons > 0 then
+		local row = MakeBody(B.Root, true)
+		Padding(0, 12, 14, 14, row)
+		List(row, 8, true, { Wraps = true })
+		for i, b in ipairs(cfg.Buttons) do
+			local btn = PillButton(row, b, i)
+			btn.MouseButton1Click:Connect(function()
+				if E.Locked then return end
+				task.spawn(SafeCall, b.Callback)
+			end)
+		end
+	end
+	function E:SetImage(img)
+		if B.Icon then B.Icon.Image = GetIcon(img) or "" end
+	end
+	function E:SetThumbnail(img)
+		if E.UIElements.Thumbnail then E.UIElements.Thumbnail.Image = GetIcon(img) or tostring(img) end
+	end
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- Code
+--------------------------------------------------------------------------
+function Elements.Code(host, cfg)
+	cfg.Title = cfg.Title or "Code"
+	local E, B = ElementBase(host, cfg, { Type = "Code", Right = 30, ControlHeight = 30 })
+	E.Code = cfg.Code or ""
+	local copy = Create("ImageButton", {
+		Name = "Copy",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0, 28, 0, 28),
+		Image = "",
+		Theme = { BackgroundColor3 = "Field", BackgroundTransparency = "FieldT" },
+		Parent = B.Control,
+	})
+	Corner(8, copy)
+	local copyIcon = IconImage("copy", 15, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Theme = { ImageColor3 = "SubText" }, Parent = copy,
+	})
+	local body = MakeBody(B.Root, true)
+	Padding(0, 12, 14, 14, body)
+	local box = Field(body, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+	Padding(10, 10, 12, 12, box)
+	local label = Create("TextLabel", {
+		Name = "Code",
+		Text = E.Code,
+		Font = Enum.Font.Code,
+		TextSize = 13,
+		RichText = false,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Theme = { TextColor3 = "Text" },
+		Parent = box,
+	})
+	copy.MouseButton1Click:Connect(function()
+		pcall(function() (setclipboard or toclipboard)(E.Code) end)
+		copyIcon.Image = GetIcon("check") or ""
+		task.delay(1.2, function() copyIcon.Image = GetIcon("copy") or "" end)
+		SafeCall(cfg.OnCopy)
+	end)
+	function E:SetCode(code)
+		E.Code = code or ""
+		label.Text = E.Code
+	end
+	E.Set = E.SetCode
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- ProgressBar
+--------------------------------------------------------------------------
+function Elements.ProgressBar(host, cfg)
+	local v = cfg.Value
+	local min, max, cur
+	if type(v) == "table" then min, max, cur = v.Min, v.Max, v.Default else min, max, cur = cfg.Min, cfg.Max, v end
+	min, max = tonumber(min) or 0, tonumber(max) or 100
+	cur = tonumber(cur) or min
+	local E, B = ElementBase(host, cfg, { Type = "ProgressBar", Right = 56 })
+	local pct = Text({
+		Name = "Percent", Font = "SemiBold", TextSize = 13, Size = UDim2.new(1, 0, 1, 0),
+		TextXAlignment = Enum.TextXAlignment.Right, Theme = { TextColor3 = "SubText" }, Parent = B.Control,
+	})
+	local body = MakeBody(B.Root, true)
+	Padding(0, 14, 14, 14, body)
+	local track = Create("Frame", {
+		Name = "Track",
+		Size = UDim2.new(1, 0, 0, 8),
+		Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+		Parent = body,
+	})
+	Corner(UDim.new(1, 0), track)
+	local fill = AccentFill(track, { Name = "Fill", Size = UDim2.new(0, 0, 1, 0) })
+	Corner(UDim.new(1, 0), fill)
+
+	local function render(instant)
+		local p = Clamp01((cur - min) / math.max(max - min, 1e-9))
+		E.Value = cur
+		pct.Text = tostring(math.floor(p * 100 + 0.5)) .. "%"
+		if instant then Set(fill, { Size = UDim2.new(p, 0, 1, 0) })
+		else Spring(fill, { Size = UDim2.new(p, 0, 1, 0) }, 2.5, 0.85) end
+	end
+	function E:Set(x)
+		cur = math.clamp(tonumber(x) or cur, min, max)
+		render(false)
+		E._Fire(cur)
+	end
+	E.SetValue = E.Set
+	function E:Get() return cur end
+	E.GetValue = E.Get
+	function E:GetPercentage() return (cur - min) / math.max(max - min, 1e-9) * 100 end
+	function E:SetRange(a, b) min, max = tonumber(a) or min, tonumber(b) or max render(false) end
+	function E:SetMin(a) E:SetRange(a, max) end
+	function E:SetMax(b) E:SetRange(min, b) end
+	render(true)
+	return Finalize(E, cfg, host)
+end
+
+--------------------------------------------------------------------------
+-- 简单元素: Label / Divider / Space / Image
+--------------------------------------------------------------------------
+local function SimpleObject(host, frame, kind)
+	local O = { __type = kind, Type = kind, ElementFrame = frame }
+	function O:Destroy() frame:Destroy() end
+	function O:SetVisible(v) frame.Visible = v and true or false end
+	host:_Added(O)
+	return O
+end
+
+function HostMethods:Label(a, b)
+	local cfg = NormalizeArgs(a, b)
+	local label = Text({
+		Name = "Label",
+		Text = cfg.Title or cfg.Text or "",
+		TextSize = cfg.TextSize or 14,
+		Font = "Regular",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		LayoutOrder = self:_Order(),
+		Theme = { TextColor3 = cfg.Color and function() return ResolveColor(cfg.Color) end or "SubText" },
+		Parent = self.Container,
+	})
+	Padding(2, 2, 6, 6, label)
+	local O = SimpleObject(self, label, "Label")
+	function O:Set(t) label.Text = t and tostring(t) or "" end
+	O.SetTitle = O.Set
+	O.SetText = O.Set
+	return O
+end
+
+function HostMethods:Divider()
+	local holder = Create("Frame", {
+		Name = "Divider",
+		Size = UDim2.new(1, 0, 0, 9),
+		BackgroundTransparency = 1,
+		LayoutOrder = self:_Order(),
+		Parent = self.Container,
+	})
+	Create("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.new(1, 0, 0, 1),
+		BorderSizePixel = 0,
+		Theme = { BackgroundColor3 = "Text" },
+		BackgroundTransparency = 0.82,
+		Parent = holder,
+	}, {
+		Create("UIGradient", { Transparency = NS({ { 0, 1 }, { 0.15, 0 }, { 0.85, 0 }, { 1, 1 } }) }),
+	})
+	return SimpleObject(self, holder, "Divider")
+end
+
+function HostMethods:Space(cfg)
+	cfg = type(cfg) == "table" and cfg or {}
+	local f = Create("Frame", {
+		Name = "Space",
+		Size = UDim2.new(1, 0, 0, 6 * (cfg.Columns or 1)),
+		BackgroundTransparency = 1,
+		LayoutOrder = self:_Order(),
+		Parent = self.Container,
+	})
+	return SimpleObject(self, f, "Space")
+end
+
+function HostMethods:Image(cfg)
+	cfg = type(cfg) == "table" and cfg or { Image = cfg }
+	local img = Create("ImageLabel", {
+		Name = "Image",
+		Image = GetIcon(cfg.Image) or tostring(cfg.Image or ""),
+		Size = UDim2.new(1, 0, 0, 100),
+		BackgroundTransparency = 1,
+		ScaleType = Enum.ScaleType.Crop,
+		LayoutOrder = self:_Order(),
+		Parent = self.Container,
+	})
+	Corner(cfg.Radius or 12, img)
+	Create("UIAspectRatioConstraint", { AspectRatio = cfg.AspectRatio or (16 / 9), Parent = img })
+	local O = SimpleObject(self, img, "Image")
+	function O:SetImage(i) img.Image = GetIcon(i) or tostring(i) end
+	return O
+end
+
+--------------------------------------------------------------------------
+-- 元素方法注册 (WindUI 名称 + Fluent / meyyUI 风格别名)
+--------------------------------------------------------------------------
+local function RegisterElement(name, ctor, aliases)
+	local fn = function(self, a, b)
+		return ctor(self, NormalizeArgs(a, b))
+	end
+	HostMethods[name] = fn
+	for _, alias in ipairs(aliases or {}) do
+		HostMethods[alias] = fn
+	end
+end
+
+RegisterElement("Toggle", Elements.Toggle, { "AddToggle", "AddSwitch", "CreateToggle", "CreateSwitch" })
+RegisterElement("Slider", Elements.Slider, { "AddSlider", "CreateSlider" })
+RegisterElement("Dropdown", Elements.Dropdown, { "AddDropdown", "AddSelector", "CreateDropdown" })
+RegisterElement("Input", Elements.Input, { "AddInput", "AddTextbox", "CreateInput" })
+RegisterElement("Keybind", Elements.Keybind, { "AddKeybind", "CreateKeybind" })
+RegisterElement("Colorpicker", Elements.Colorpicker, { "AddColorpicker", "AddColorPicker", "CreateColorpicker" })
+RegisterElement("Button", Elements.Button, { "AddButton", "CreateButton" })
+RegisterElement("Paragraph", Elements.Paragraph, { "AddParagraph", "CreateParagraph" })
+RegisterElement("Code", Elements.Code, { "AddCode" })
+RegisterElement("ProgressBar", Elements.ProgressBar, { "AddProgressBar", "Progress" })
+
+function HostMethods:AddMultiDropdown(a, b)
+	local cfg = NormalizeArgs(a, b)
+	cfg.Multi = true
+	return Elements.Dropdown(self, cfg)
+end
+HostMethods.CreateMultiDropdown = HostMethods.AddMultiDropdown
+HostMethods.AddLabel = HostMethods.Label
+HostMethods.CreateLabel = HostMethods.Label
+HostMethods.AddDivider = HostMethods.Divider
+HostMethods.AddSpace = HostMethods.Space
+
+--------------------------------------------------------------------------
+-- Section (可折叠, Box = true 时带玻璃底板)
+--------------------------------------------------------------------------
+function HostMethods:Section(a, b)
+	local cfg = type(a) == "string" and { Title = a } or NormalizeArgs(a, b)
+	local window, tab = self.Window, self.Tab
+	local frame = Create("Frame", {
+		Name = "Section",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = self:_Order(),
+		Parent = self.Container,
+	})
+	List(frame, 8)
+
+	local header = Create("TextButton", {
+		Name = "Header",
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 1,
+		Parent = frame,
+	})
+	Padding(8, 0, 4, 4, header)
+	local off = 0
+	if cfg.Icon and GetIcon(cfg.Icon) then
+		IconImage(cfg.Icon, 18, {
+			Position = UDim2.new(0, 0, 0, 1),
+			Theme = { ImageColor3 = cfg.IconThemed == false and "Text" or "Accent" }, Parent = header,
+		})
+		off = 26
+	else
+		local mark = AccentFill(header, {
+			Name = "Mark",
+			Position = UDim2.new(0, 0, 0, 2),
+			Size = UDim2.new(0, 3, 0, 16),
+		})
+		Corner(UDim.new(1, 0), mark)
+		mark:FindFirstChildWhichIsA("UIGradient").Rotation = 90
+		off = 11
+	end
+	local labels = Create("Frame", {
+		Name = "Labels",
+		Position = UDim2.new(0, off, 0, 0),
+		Size = UDim2.new(1, -(off + 24), 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = header,
+	})
+	List(labels, 2)
+	local xAlign = cfg.TextXAlignment
+	if type(xAlign) == "string" then xAlign = Enum.TextXAlignment[xAlign] end
+	local title = Text({
+		Name = "Title",
+		Text = cfg.Title or "",
+		Font = "SemiBold",
+		TextSize = cfg.TextSize or 15,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		TextXAlignment = xAlign or Enum.TextXAlignment.Left,
+		LayoutOrder = 1,
+		Parent = labels,
+	})
+	local desc = Text({
+		Name = "Desc",
+		Text = cfg.Desc or "",
+		Font = "Regular",
+		TextSize = cfg.DescTextSize or 13,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		TextWrapped = true,
+		TextXAlignment = xAlign or Enum.TextXAlignment.Left,
+		Visible = cfg.Desc ~= nil and cfg.Desc ~= "",
+		LayoutOrder = 2,
+		Theme = { TextColor3 = "SubText" },
+		Parent = labels,
+	})
+	local chevron = IconImage("chevron-down", 16, {
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 0, 0, 2),
+		Visible = false,
+		Theme = { ImageColor3 = "SubText" },
+		Parent = header,
+	})
+
+	local body = Create("Frame", {
+		Name = "Body",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+		Visible = false,
+		Parent = frame,
+	})
+	local inner = Create("Frame", {
+		Name = "Inner",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = body,
+	})
+	if cfg.Box then
+		Bind(inner, { BackgroundColor3 = "Panel", BackgroundTransparency = "PanelT" })
+		Corner(14, inner)
+		Rim(inner, "ElementStrokeT")
+		Padding(8, 8, 8, 8, inner)
+	end
+	List(inner, 8)
+
+	local S = NewHost(window, tab, inner, {
+		__type = "Section",
+		Title = cfg.Title,
+		Opened = cfg.Opened ~= false,
+		Count = 0,
+		ElementFrame = frame,
+		UIElements = { Main = frame, Header = header, Title = title, Body = body },
+	})
+	local animating = 0
+
+	function S:_Added()
+		S.Count = S.Count + 1
+		chevron.Visible = true
+		chevron.Rotation = S.Opened and 0 or -90
+		if S.Opened then body.Visible = true end
+	end
+
+	function S:Open()
+		if S.Opened then return end
+		S.Opened = true
+		if S.Count == 0 then return end
+		animating = animating + 1
+		local my = animating
+		body.Visible = true
+		body.AutomaticSize = Enum.AutomaticSize.None
+		body.ClipsDescendants = true
+		Spring(body, { Size = UDim2.new(1, 0, 0, inner.AbsoluteSize.Y / EffectiveScale(body)) }, 3.6, 0.85)
+		Spring(chevron, { Rotation = 0 }, 4.5, 0.65)
+		task.delay(0.45, function()
+			if my == animating and S.Opened then
+				Set(body, { Size = UDim2.new(1, 0, 0, 0) })
+				body.AutomaticSize = Enum.AutomaticSize.Y
+				body.ClipsDescendants = false
+			end
+		end)
+	end
+
+	function S:Close()
+		if not S.Opened then return end
+		S.Opened = false
+		if S.Count == 0 then return end
+		animating = animating + 1
+		local my = animating
+		local hgt = body.AbsoluteSize.Y / EffectiveScale(body)
+		body.AutomaticSize = Enum.AutomaticSize.None
+		body.ClipsDescendants = true
+		Set(body, { Size = UDim2.new(1, 0, 0, hgt) })
+		Spring(body, { Size = UDim2.new(1, 0, 0, 0) }, 4, 1)
+		Spring(chevron, { Rotation = -90 }, 4.5, 0.65)
+		task.delay(0.35, function()
+			if my == animating and not S.Opened then body.Visible = false end
+		end)
+	end
+
+	header.MouseButton1Click:Connect(function()
+		if S.Count == 0 then return end
+		if S.Opened then S:Close() else S:Open() end
+	end)
+
+	function S:SetTitle(t)
+		S.Title = t
+		title.Text = t or ""
+	end
+	function S:SetDesc(d)
+		desc.Text = d or ""
+		desc.Visible = d ~= nil and d ~= ""
+	end
+	function S:SetVisible(v) frame.Visible = v and true or false end
+	function S:Destroy() frame:Destroy() end
+
+	self:_Added(S)
+	return S
+end
+HostMethods.AddSection = HostMethods.Section
+HostMethods.CreateSection = HostMethods.Section
+
+--------------------------------------------------------------------------
+-- Group (横向并排)
+--------------------------------------------------------------------------
+function HostMethods:Group()
+	local frame = Create("Frame", {
+		Name = "Group",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = self:_Order(),
+		Parent = self.Container,
+	})
+	List(frame, 8, true)
+	local G = NewHost(self.Window, self.Tab, frame, { __type = "Group", Items = {}, ElementFrame = frame })
+	function G:_Added(E)
+		local f = E.ElementFrame
+		if not f then return end
+		table.insert(G.Items, f)
+		local n = #G.Items
+		for _, item in ipairs(G.Items) do
+			item.Size = UDim2.new(1 / n, -8 * (n - 1) / n, item.Size.Y.Scale, item.Size.Y.Offset)
+		end
+	end
+	function G:Destroy() frame:Destroy() end
+	self:_Added(G)
+	return G
+end
+
+--------------------------------------------------------------------------
+-- 窗口
+--------------------------------------------------------------------------
+-- 把 EnumItem / "RightShift" 之类的字符串转成 Enum.KeyCode; 无效值 / "None" / false 返回 nil (= 不绑定快捷键)
+function WindUI.ParseKey(k)
+	if typeof(k) == "EnumItem" then return k end
+	if type(k) == "string" and k ~= "" then
+		local ok, e = pcall(function() return Enum.KeyCode[k] end)
+		if ok and typeof(e) == "EnumItem" then return e end
+	end
+	return nil
+end
+
+WindUI.Strings = {
+	CloseTitle = "关闭窗口",
+	CloseContent = "确定要关闭窗口吗? 关闭后需要重新执行脚本才能再次打开。",
+	Cancel = "取消",
+	Close = "关闭",
+	Hidden = "界面已隐藏",
+	Reopen = "按 %s 重新打开",
+	Search = "搜索...",
+	Anonymous = "匿名用户",
+}
+
+local TOPBAR = 52
+local SUBBAR = 40
+
+-- 通用对话框 (窗口内 Dialog / 全屏 Popup 共用)
+local function ShowDialog(parent, cfg, z, radius)
+	z = z or 60
+	local D = { Closed = false }
+	local layer = Create("Frame", {
+		Name = "DialogLayer",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = z,
+		Parent = parent,
+	})
+	local backdrop = Create("TextButton", {
+		Name = "Backdrop",
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = z,
+		Theme = { BackgroundColor3 = "Backdrop" },
+		Parent = layer,
+	})
+	-- 窗口内对话框: 遮罩跟窗口一样圆角 (窗口不再用 CanvasGroup 裁剪)
+	if radius then Corner(radius, backdrop) end
+	local card = Create("CanvasGroup", {
+		Name = "Dialog",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, cfg.Width or 340, 0, 120),
+		GroupTransparency = 1,
+		ZIndex = z + 1,
+		Theme = {
+			BackgroundColor3 = "Glass",
+			BackgroundTransparency = function(th) return math.min(GlassT(th), 0.1) end,
+		},
+		Parent = layer,
+	})
+	Corner(18, card)
+	Sheen(card, 18, z + 1)
+	local rimHolder = Create("Frame", {
+		Position = UDim2.new(0, 1, 0, 1), Size = UDim2.new(1, -2, 1, -2),
+		BackgroundTransparency = 1, ZIndex = z + 2, Parent = card,
+	})
+	Corner(17, rimHolder)
+	Rim(rimHolder)
+	local scale = Create("UIScale", { Scale = 0.88, Parent = card })
+
+	local content = Create("Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		ZIndex = z + 3,
+		Parent = card,
+	})
+	Padding(20, 18, 20, 20, content)
+	List(content, 10)
+	FollowHeight(card, content)
+
+	local titleRow = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1, LayoutOrder = 1, ZIndex = z + 3, Parent = content,
+	})
+	local tOff = 0
+	if cfg.Icon and GetIcon(cfg.Icon) then
+		IconImage(cfg.Icon, 22, { ZIndex = z + 3, Theme = { ImageColor3 = "Accent" }, Parent = titleRow })
+		tOff = 32
+	end
+	Text({
+		Text = cfg.Title or "", Font = "SemiBold", TextSize = 18, ZIndex = z + 3,
+		Position = UDim2.new(0, tOff, 0, 0), Size = UDim2.new(1, -tOff, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true, Parent = titleRow,
+	})
+	if cfg.Content and cfg.Content ~= "" then
+		Text({
+			Text = tostring(cfg.Content), TextSize = 14, Font = "Regular", ZIndex = z + 3, LayoutOrder = 2,
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, TextWrapped = true,
+			Theme = { TextColor3 = "SubText" }, Parent = content,
+		})
+	end
+	local row = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, LayoutOrder = 3, ZIndex = z + 3, Parent = content,
+	})
+	List(row, 8, true, { HorizontalAlignment = Enum.HorizontalAlignment.Right })
+
+	function D:Close()
+		if D.Closed then return end
+		D.Closed = true
+		Spring(backdrop, { BackgroundTransparency = 1 }, 4, 1)
+		Spring(scale, { Scale = 0.92 }, 5, 1)
+		Tween(card, 0.15, { GroupTransparency = 1 })
+		task.delay(0.25, function() layer:Destroy() end)
+	end
+
+	for i, b in ipairs(cfg.Buttons or {}) do
+		local btn = PillButton(row, b, i)
+		btn.ZIndex = z + 4
+		for _, d in ipairs(btn:GetDescendants()) do
+			if d:IsA("GuiObject") then d.ZIndex = z + 4 end
+		end
+		btn.MouseButton1Click:Connect(function()
+			D:Close()
+			task.spawn(SafeCall, b.Callback)
+		end)
+	end
+
+	Spring(backdrop, { BackgroundTransparency = WindUI.Theme.BackdropT }, 4, 1)
+	Spring(scale, { Scale = 1 }, 3.4, 0.62)
+	Tween(card, 0.2, { GroupTransparency = 0 })
+	return D
+end
+
+function WindUI:Popup(cfg)
+	return ShowDialog(GetOverlay(), cfg or {}, 30)
+end
+
+local TabMethods = setmetatable({}, { __index = HostMethods })
+local TabMT = { __index = TabMethods }
+local WindowMethods = {}
+local WindowMT = { __index = WindowMethods }
+
+function WindUI:CreateWindow(cfg)
+	cfg = cfg or {}
+	if cfg.Theme and self.Themes[cfg.Theme] then
+		self.Theme = self.Themes[cfg.Theme]
+		self.CurrentThemeName = cfg.Theme
+	end
+	if cfg.Transparent == true then self.Transparency = 0.72 end
+	if cfg.Acrylic then self.Acrylic = true end
+	if cfg.Font then self:SetFont(cfg.Font) end
+
+	local size = cfg.Size or UDim2.fromOffset(620, 460)
+	local W = setmetatable({
+		Title = cfg.Title or "LiquidGlass",
+		Author = cfg.Author,
+		Icon = cfg.Icon,
+		Folder = cfg.Folder or cfg.Title or "LiquidGlass",
+		Tabs = {},
+		Flags = {},
+		AllElements = {},
+		Closed = false,
+		Destroyed = false,
+		IsFullscreen = false,
+		Maximized = false,
+		Resizable = cfg.Resizable ~= false,
+		MinSize = cfg.MinSize or Vector2.new(460, 340),
+		MaxSize = cfg.MaxSize or Vector2.new(1200, 860),
+		ToggleKey = WindUI.ParseKey(cfg.ToggleKey), -- 默认不绑定快捷键 (nil); 需要时传 ToggleKey = Enum.KeyCode.X
+		SideBarWidth = cfg.SideBarWidth or 190,
+		UIElements = {},
+		_open = {}, _close = {}, _destroy = {}, _conns = {},
+		_sideOrder = 0,
+	}, WindowMT)
+	-- 侧边栏里标签 / 分隔线 / 分组按创建顺序排列
+	local function NextSideOrder()
+		W._sideOrder = W._sideOrder + 1
+		return W._sideOrder
+	end
+	table.insert(self.Windows, W)
+	self.Window = W
+	local R = cfg.Radius or 18
+	local sideW = W.SideBarWidth
+
+	local gui = NewScreenGui("LiquidGlass", 10000)
+	W.ScreenGui = gui
+
+	local root = Create("Frame", {
+		Name = "Window",
+		BackgroundTransparency = 1,
+		Size = size,
+		Position = UDim2.new(0.5, -size.X.Offset / 2, 0.5, -size.Y.Offset / 2),
+		Parent = gui,
+	})
+	local userScale = Create("UIScale", { Name = "UserScale", Scale = 1, Parent = root })
+	local scaler = Create("Frame", {
+		Name = "Scaler",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Parent = root,
+	})
+	-- 动画只缩放不含文字的玻璃外壳 (shell); 内容层 (canvas) 不在缩放节点下, 动画期间隐藏。
+	-- 缩放会让所有文字每帧按新像素尺寸重新排版 / 光栅化, 内容一多就掉帧; 平移则很便宜。
+	local shell = Create("Frame", {
+		Name = "Shell",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 1,
+		Parent = scaler,
+	})
+	local animScale = Create("UIScale", { Name = "AnimScale", Scale = 0, Parent = shell })
+	local shadow = Shadow(shell, 110, 0)
+	Bind(shadow, { ImageTransparency = function(t) return W.Closed and 1 or t.ShadowT end })
+
+	-- 内容层: 普通 Frame (不用 CanvasGroup, 它每次变化都要整窗重绘贴图)
+	local canvas = Create("Frame", {
+		Name = "Canvas",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Visible = false,
+		ZIndex = 2,
+		Parent = scaler,
+	})
+
+	W.Root = root
+	W.Size = root.Size
+	W.Position = root.Position
+	W.UIElements.Main = root
+	W.UIElements.Canvas = canvas
+	W.UIElements.Shell = shell
+
+	-- 玻璃分层 (都在 shell 里, 没有文字)
+	local bgImage = Create("ImageLabel", {
+		Name = "BackgroundImage",
+		Size = UDim2.new(1, 0, 1, 0),
+		BackgroundTransparency = 1,
+		Image = cfg.Background and (GetIcon(cfg.Background) or tostring(cfg.Background)) or "",
+		ImageTransparency = cfg.BackgroundImageTransparency or 0,
+		ScaleType = Enum.ScaleType.Crop,
+		Visible = cfg.Background ~= nil,
+		ZIndex = 0,
+		Parent = shell,
+	})
+	Corner(R, bgImage)
+	local base = Create("Frame", {
+		Name = "Glass",
+		Size = UDim2.new(1, 0, 1, 0),
+		BorderSizePixel = 0,
+		ZIndex = 1,
+		Theme = { BackgroundColor3 = "Glass", BackgroundTransparency = GlassT },
+		Parent = shell,
+	})
+	Corner(R, base)
+	-- 纵向明暗: 顶部亮、底部略暗, 玻璃更有厚度
+	local shade = Create("UIGradient", { Rotation = 90, Parent = base })
+	Bind(shade, { Color = function(t) return CS({ { 0, WHITE }, { 1, t.GlassShade } }) end })
+
+	Noise(shell, R, 1)
+	Sheen(shell, R, 2)
+	local rimFrame = Create("Frame", {
+		Name = "Rim",
+		Position = UDim2.new(0, 1, 0, 1),
+		Size = UDim2.new(1, -2, 1, -2),
+		BackgroundTransparency = 1,
+		ZIndex = 50,
+		Parent = shell,
+	})
+	Corner(R - 1, rimFrame)
+	Rim(rimFrame, "StrokeT", 1.2)
+	-- 高光边内侧再压一道暗线, 形成玻璃边缘的折射厚度
+	local innerEdge = Create("Frame", {
+		Name = "InnerEdge",
+		Position = UDim2.new(0, 2, 0, 2),
+		Size = UDim2.new(1, -4, 1, -4),
+		BackgroundTransparency = 1,
+		ZIndex = 50,
+		Parent = shell,
+	})
+	Corner(R - 2, innerEdge)
+	Create("UIStroke", { Color = BLACK, Thickness = 1, Theme = { Transparency = "InnerT" }, Parent = innerEdge })
+
+	------------------------------------------------------------------
+	-- 顶栏
+	------------------------------------------------------------------
+	local topbar = Create("Frame", {
+		Name = "Topbar",
+		Size = UDim2.new(1, 0, 0, TOPBAR),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = canvas,
+	})
+	local mac = cfg.Topbar and cfg.Topbar.ButtonsType == "Mac"
+	local titleHolder = Create("Frame", {
+		Name = "TitleHolder",
+		Position = UDim2.new(0, mac and 84 or 18, 0, 0),
+		Size = UDim2.new(1, -(mac and 84 or 18) - 150, 1, 0),
+		BackgroundTransparency = 1,
+		ZIndex = 5,
+		Parent = topbar,
+	})
+	List(titleHolder, 10, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+	local windowIcon
+	if cfg.Icon and GetIcon(cfg.Icon) then
+		if IsLucide(cfg.Icon) and cfg.IconThemed ~= false then
+			-- 主题色渐变图标块
+			local chip = Create("Frame", {
+				Name = "IconChip",
+				Size = UDim2.new(0, 30, 0, 30),
+				BackgroundColor3 = WHITE,
+				LayoutOrder = 1,
+				ZIndex = 5,
+				Parent = titleHolder,
+			})
+			Corner(9, chip)
+			Bind(Create("UIGradient", { Rotation = 45, Parent = chip }), { Color = AccentSequence })
+			Rim(chip, "StrokeT")
+			windowIcon = IconImage(cfg.Icon, 17, {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), ZIndex = 6,
+				Theme = { ImageColor3 = "OnAccent" }, Parent = chip,
+			})
+		else
+			local isz = cfg.IconSize or 26
+			windowIcon = IconImage(cfg.Icon, isz, {
+				LayoutOrder = 1, ZIndex = 5,
+				Theme = { ImageColor3 = function() return WHITE end },
+				Parent = titleHolder,
+			})
+			Corner(cfg.IconRadius or 8, windowIcon)
+		end
+	end
+	local titles = Create("Frame", {
+		Name = "Titles",
+		Size = UDim2.new(0, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.XY,
+		BackgroundTransparency = 1,
+		LayoutOrder = 2,
+		ZIndex = 5,
+		Parent = titleHolder,
+	})
+	List(titles, 1)
+	local titleLabel = Text({
+		Name = "Title", Text = W.Title, Font = "Bold", TextSize = 15, ZIndex = 5, LayoutOrder = 1,
+		Size = UDim2.new(0, 0, 0, 18), AutomaticSize = Enum.AutomaticSize.X, Parent = titles,
+		Theme = { TextColor3 = function() return WHITE end },
+	})
+	Bind(Create("UIGradient", { Parent = titleLabel }), { Color = TitleSequence })
+	local authorLabel = Text({
+		Name = "Author", Text = W.Author or "", Font = "Regular", TextSize = 12, ZIndex = 5, LayoutOrder = 2,
+		Size = UDim2.new(0, 0, 0, 14), AutomaticSize = Enum.AutomaticSize.X, Visible = W.Author ~= nil and W.Author ~= "",
+		Theme = { TextColor3 = "SubText" }, Parent = titles,
+	})
+	local tagHolder = Create("Frame", {
+		Name = "Tags",
+		Size = UDim2.new(0, 0, 0, 22),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		LayoutOrder = 3,
+		ZIndex = 5,
+		Parent = titleHolder,
+	})
+	List(tagHolder, 6, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+
+	local buttons = Create("Frame", {
+		Name = "Buttons",
+		AnchorPoint = mac and Vector2.new(0, 0.5) or Vector2.new(1, 0.5),
+		Position = mac and UDim2.new(0, 18, 0.5, 0) or UDim2.new(1, -14, 0.5, 0),
+		Size = UDim2.new(0, 0, 0, 30),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		ZIndex = 6,
+		Parent = topbar,
+	})
+	List(buttons, mac and 8 or 6, true, {
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		HorizontalAlignment = mac and Enum.HorizontalAlignment.Left or Enum.HorizontalAlignment.Right,
+	})
+	local customButtons = Create("Frame", {
+		Name = "Custom",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = mac and UDim2.new(1, -14, 0.5, 0) or UDim2.new(1, -124, 0.5, 0),
+		Size = UDim2.new(0, 0, 0, 30),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		ZIndex = 6,
+		Parent = topbar,
+	})
+	List(customButtons, 6, true, { VerticalAlignment = Enum.VerticalAlignment.Center, HorizontalAlignment = Enum.HorizontalAlignment.Right })
+	W.TopbarButtons = {}
+
+	local MacColors = { Close = RGB(255, 95, 87), Minimize = RGB(254, 188, 46), Fullscreen = RGB(40, 200, 64) }
+	local function TopButton(parent, name, icon, order, callback, danger, macStyle)
+		local st = { Hover = false }
+		local bsize = macStyle and 13 or 30
+		local b = Create("TextButton", {
+			Name = name,
+			Text = "",
+			AutoButtonColor = false,
+			Size = UDim2.new(0, bsize, 0, bsize),
+			LayoutOrder = order or 0,
+			ZIndex = 6,
+			Theme = macStyle and { BackgroundColor3 = function() return MacColors[name] or WHITE end } or {
+				BackgroundColor3 = function(t) return (st.Hover and danger) and t.Error or t.Element end,
+				BackgroundTransparency = function(t)
+					if st.Hover then return danger and 0.1 or math.max(t.ElementT - 0.1, 0) end
+					return t.ElementT
+				end,
+			},
+			Parent = parent,
+		})
+		Corner(UDim.new(1, 0), b)
+		if not macStyle then Rim(b, "ElementStrokeT") end
+		local ic = IconImage(icon, macStyle and 9 or 15, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), ZIndex = 7,
+			ImageTransparency = macStyle and 1 or 0,
+			Theme = { ImageColor3 = function(t)
+				if macStyle then return RGB(60, 30, 20) end
+				return (st.Hover and danger) and WHITE or t.Text
+			end },
+			Parent = b,
+		})
+		b.MouseEnter:Connect(function()
+			st.Hover = true
+			Restyle(b, 6)
+			Restyle(ic, 6)
+			if macStyle then Spring(ic, { ImageTransparency = 0 }, 6, 1) end
+		end)
+		b.MouseLeave:Connect(function()
+			st.Hover = false
+			Restyle(b, 4)
+			Restyle(ic, 4)
+			if macStyle then Spring(ic, { ImageTransparency = 1 }, 6, 1) end
+		end)
+		PressScale(b)
+		b.MouseButton1Click:Connect(function() SafeCall(callback) end)
+		W.TopbarButtons[name] = b
+		return b
+	end
+
+	------------------------------------------------------------------
+	-- 侧边栏
+	------------------------------------------------------------------
+	local sidebar = Create("Frame", {
+		Name = "Sidebar",
+		Position = UDim2.new(0, 10, 0, TOPBAR),
+		Size = UDim2.new(0, sideW, 1, -(TOPBAR + 10)),
+		ZIndex = 3,
+		Theme = { BackgroundColor3 = "Panel", BackgroundTransparency = "PanelT" },
+		Parent = canvas,
+	})
+	Corner(14, sidebar)
+	Rim(sidebar, "ElementStrokeT")
+	Padding(8, 8, 8, 8, sidebar)
+	W.UIElements.Sidebar = sidebar
+
+	local yOff = 0
+	local searchBox
+	if not cfg.HideSearchBar then
+		local sf = Field(sidebar, { Size = UDim2.new(1, 0, 0, 32), ZIndex = 3 })
+		IconImage("search", 14, {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), ZIndex = 3,
+			Theme = { ImageColor3 = "Placeholder" }, Parent = sf,
+		})
+		searchBox = Create("TextBox", {
+			Name = "Search",
+			Text = "",
+			PlaceholderText = WindUI.Strings.Search,
+			ClearTextOnFocus = false,
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 31, 0, 0),
+			Size = UDim2.new(1, -38, 1, 0),
+			TextSize = 13,
+			Font = "Regular",
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 3,
+			Theme = { TextColor3 = "Text", PlaceholderColor3 = "Placeholder" },
+			Parent = sf,
+		})
+		yOff = 40
+	end
+
+	local userH = 0
+	local userCfg = cfg.User or {}
+	if userCfg.Enabled then
+		userH = 56
+		local card = Create("TextButton", {
+			Name = "User",
+			Text = "",
+			AutoButtonColor = false,
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.new(0, 0, 1, 0),
+			Size = UDim2.new(1, 0, 0, 48),
+			ZIndex = 3,
+			Theme = { BackgroundColor3 = "Element", BackgroundTransparency = "ElementT" },
+			Parent = sidebar,
+		})
+		Corner(12, card)
+		Rim(card, "ElementStrokeT")
+		local avatar = Create("ImageLabel", {
+			Name = "Avatar",
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 8, 0.5, 0),
+			Size = UDim2.new(0, 32, 0, 32),
+			ZIndex = 3,
+			Theme = { BackgroundColor3 = "Track", BackgroundTransparency = "TrackT" },
+			Image = userCfg.Anonymous and (GetIcon("user") or "")
+				or ("rbxthumb://type=AvatarHeadShot&id=" .. tostring(LocalPlayer.UserId) .. "&w=150&h=150"),
+			Parent = card,
+		})
+		Corner(UDim.new(1, 0), avatar)
+		Text({
+			Text = userCfg.Anonymous and WindUI.Strings.Anonymous or LocalPlayer.DisplayName,
+			Font = "SemiBold", TextSize = 13, ZIndex = 3, TextTruncate = Enum.TextTruncate.AtEnd,
+			Position = UDim2.new(0, 48, 0, 8), Size = UDim2.new(1, -54, 0, 16), Parent = card,
+		})
+		Text({
+			Text = userCfg.Anonymous and "@anonymous" or ("@" .. LocalPlayer.Name),
+			Font = "Regular", TextSize = 12, ZIndex = 3, TextTruncate = Enum.TextTruncate.AtEnd,
+			Position = UDim2.new(0, 48, 0, 25), Size = UDim2.new(1, -54, 0, 14),
+			Theme = { TextColor3 = "SubText" }, Parent = card,
+		})
+		card.MouseButton1Click:Connect(function() SafeCall(userCfg.Callback) end)
+	end
+
+	local tabScroll = Create("ScrollingFrame", {
+		Name = "Tabs",
+		Position = UDim2.new(0, 0, 0, yOff),
+		Size = UDim2.new(1, 0, 1, -(yOff + userH)),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 0,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ZIndex = 3,
+		Parent = sidebar,
+	})
+	local indicator = Create("Frame", {
+		Name = "Indicator",
+		Size = UDim2.new(1, 0, 0, 0),
+		Visible = false,
+		ZIndex = 3,
+		BackgroundColor3 = WHITE,
+		Theme = { BackgroundTransparency = "IndicatorT" },
+		Parent = tabScroll,
+	})
+	Corner(10, indicator)
+	-- 中性玻璃胶囊 (浅色主题为白色浮起块), 主题色只留给左侧竖条和图标
+	Rim(indicator, function(t) return math.max(t.ElementStrokeT - 0.3, 0) end)
+	Sheen(indicator, 10, 3)
+	local indBar = AccentFill(indicator, {
+		Name = "Bar",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 5, 0.5, 0),
+		Size = UDim2.new(0, 3, 0.5, 0),
+		ZIndex = 4,
+	})
+	Corner(UDim.new(1, 0), indBar)
+	local tabHolder = Create("Frame", {
+		Name = "Holder",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		ZIndex = 4,
+		Parent = tabScroll,
+	})
+	List(tabHolder, 4)
+	W.UIElements.TabHolder = tabHolder
+
+	-- 液态指示器: 上下边缘用不同速度的弹簧, 移动时拉长再收拢
+	local P = { Top = 0, Bottom = 0 }
+	SpringHooks[P] = function(p)
+		indicator.Position = UDim2.new(0, 0, 0, p.Top)
+		indicator.Size = UDim2.new(1, 0, 0, math.max(p.Bottom - p.Top, 6))
+	end
+	local indTry = 0
+	function W:_MoveIndicator(instant)
+		local tab = W.SelectedTab
+		if not tab or not tab.Frame.Visible then
+			indicator.Visible = false
+			return
+		end
+		local btn = tab.Frame
+		if btn.AbsoluteSize.Y <= 0 then
+			indTry = indTry + 1
+			if indTry < 30 then task.delay(0.03, function() W:_MoveIndicator(instant) end) end
+			return
+		end
+		indTry = 0
+		local s = EffectiveScale(tabHolder)
+		local top = (btn.AbsolutePosition.Y - tabHolder.AbsolutePosition.Y) / s
+		local bottom = top + btn.AbsoluteSize.Y / s
+		if instant or not indicator.Visible then
+			indicator.Visible = true
+			Set(P, { Top = top, Bottom = bottom })
+			SpringHooks[P](P)
+			return
+		end
+		if top > P.Top then
+			Spring(P, { Bottom = bottom }, 5, 0.75)
+			Spring(P, { Top = top }, 2.5, 0.9)
+		else
+			Spring(P, { Top = top }, 5, 0.75)
+			Spring(P, { Bottom = bottom }, 2.5, 0.9)
+		end
+	end
+	tabHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		task.defer(function() W:_MoveIndicator(false) end)
+	end)
+
+	------------------------------------------------------------------
+	-- 内容区
+	------------------------------------------------------------------
+	local showTitle = cfg.ShowTabTitle ~= false
+	local headerH = showTitle and 40 or 0
+	local content = Create("Frame", {
+		Name = "Content",
+		Position = UDim2.new(0, sideW + 20, 0, TOPBAR - 4),
+		Size = UDim2.new(1, -(sideW + 26), 1, -(TOPBAR + 6)),
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+		Parent = canvas,
+	})
+	W.UIElements.Content = content
+	local pageTitle = Text({
+		Name = "PageTitle",
+		Text = "",
+		Font = "Bold",
+		TextSize = 21,
+		Position = UDim2.new(0, 4, 0, 0),
+		Size = UDim2.new(1, -12, 0, 32),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Visible = showTitle,
+		ZIndex = 3,
+		Theme = { TextColor3 = function() return WHITE end },
+		Parent = content,
+	})
+	Bind(Create("UIGradient", { Parent = pageTitle }), { Color = TitleSequence })
+
+	-- 切换标签时一道斜向流光扫过内容区
+	local function Sweep()
+		local clip = Create("Frame", {
+			Name = "Sweep",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			ClipsDescendants = true,
+			ZIndex = 20,
+			Parent = content,
+		})
+		local band = Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(-0.25, 0, 0.5, 0),
+			Size = UDim2.new(0, 140, 1.6, 0),
+			Rotation = 14,
+			BorderSizePixel = 0,
+			ZIndex = 20,
+			Theme = { BackgroundColor3 = function(t) return t.Dark and WHITE or t.Accent end },
+			BackgroundTransparency = 0.88,
+			Parent = clip,
+		}, {
+			Create("UIGradient", { Transparency = NS({ { 0, 1 }, { 0.5, 0 }, { 1, 1 } }) }),
+		})
+		Tween(band, TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+			Position = UDim2.new(1.25, 0, 0.5, 0),
+		})
+		task.delay(0.75, function() clip:Destroy() end)
+	end
+	local pages = Create("Frame", {
+		Name = "Pages",
+		Position = UDim2.new(0, 0, 0, headerH),
+		Size = UDim2.new(1, 0, 1, -headerH),
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+		Parent = content,
+	})
+
+	------------------------------------------------------------------
+	-- 拖动 / 缩放
+	------------------------------------------------------------------
+	local dragStart, startPos
+	OnDrag(topbar, function(input)
+		if W.IsFullscreen then return false end
+		dragStart, startPos = input.Position, root.Position
+	end, function(input)
+		local d = input.Position - dragStart
+		local target = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		Spring(root, { Position = target }, 9, 1)
+		W.Position = target
+	end)
+
+	local grip = Create("TextButton", {
+		Name = "Resize",
+		Text = "",
+		AutoButtonColor = false,
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -2, 1, -2),
+		Size = UDim2.new(0, 18, 0, 18),
+		BackgroundTransparency = 1,
+		ZIndex = 40,
+		Visible = W.Resizable,
+		Parent = canvas,
+	})
+	for i, len in ipairs({ 10, 5 }) do
+		Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0, 11 + (i - 1) * 2, 0, 11 + (i - 1) * 2),
+			Size = UDim2.new(0, len, 0, 2),
+			Rotation = -45,
+			BorderSizePixel = 0,
+			ZIndex = 40,
+			Theme = { BackgroundColor3 = "SubText" },
+			BackgroundTransparency = 0.4,
+			Parent = grip,
+		})
+	end
+	local rsStart, rsSize
+	OnDrag(grip, function(input)
+		if W.IsFullscreen or not W.Resizable then return false end
+		rsStart = input.Position
+		rsSize = root.AbsoluteSize
+	end, function(input)
+		local s = math.max(userScale.Scale, 0.01)
+		local w = math.clamp((rsSize.X + input.Position.X - rsStart.X) / s, W.MinSize.X, W.MaxSize.X)
+		local h = math.clamp((rsSize.Y + input.Position.Y - rsStart.Y) / s, W.MinSize.Y, W.MaxSize.Y)
+		root.Size = UDim2.fromOffset(w, h)
+		W.Size = root.Size
+	end)
+
+	------------------------------------------------------------------
+	-- 打开按钮 (隐藏后显示, 可拖动)
+	------------------------------------------------------------------
+	local openCfg = {
+		Title = W.Title, Icon = cfg.Icon or "layers", Enabled = true, OnlyMobile = false,
+		OnlyIcon = false, Draggable = true, StrokeThickness = 2, CornerRadius = UDim.new(1, 0),
+	}
+	for k, v in pairs(cfg.OpenButton or {}) do openCfg[k] = v end
+	local openBtn
+	-- 悬浮按钮单独一个忽略顶栏留白的 ScreenGui, 坐标从屏幕最顶端算起
+	local openGui = NewScreenGui("LiquidGlass_OpenButton", 10005, true)
+	W.OpenButtonGui = openGui
+	local function BuildOpenButton()
+		if openBtn then openBtn:Destroy() end
+		local o = openCfg
+		openBtn = Create("TextButton", {
+			Name = "OpenButton",
+			Text = "",
+			AutoButtonColor = false,
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = o.Position or UDim2.new(0.5, 0, 0, 6),
+			Size = UDim2.new(0, 0, 0, 44),
+			AutomaticSize = Enum.AutomaticSize.X,
+			Visible = false,
+			ZIndex = 100,
+			Theme = {
+				BackgroundColor3 = "Glass",
+				BackgroundTransparency = function(t) return math.min(GlassT(t), 0.2) end,
+			},
+			Parent = openGui,
+		})
+		Create("UICorner", { CornerRadius = o.CornerRadius or UDim.new(1, 0), Parent = openBtn })
+		local stroke = Create("UIStroke", {
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Thickness = o.StrokeThickness or 2,
+			Color = WHITE,
+			Parent = openBtn,
+		})
+		local g = Create("UIGradient", { Parent = stroke })
+		if typeof(o.Color) == "ColorSequence" then
+			g.Color = o.Color
+		elseif type(o.Color) == "table" and o.Color.Color then
+			g.Color = o.Color.Color
+		else
+			Bind(g, { Color = AccentSequence })
+		end
+		W._openStrokeGrad = g
+		Padding(0, 0, 14, o.OnlyIcon and 14 or 18, openBtn)
+		List(openBtn, 8, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+		if GetIcon(o.Icon) then
+			IconImage(o.Icon, 20, {
+				LayoutOrder = 1, ZIndex = 101,
+				Theme = { ImageColor3 = IsLucide(o.Icon) and "Text" or function() return WHITE end },
+				Parent = openBtn,
+			})
+		end
+		if not o.OnlyIcon then
+			Text({
+				Text = o.Title or W.Title, Font = "SemiBold", TextSize = 14, LayoutOrder = 2, ZIndex = 101,
+				Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Parent = openBtn,
+			})
+		end
+		local scale = Create("UIScale", { Scale = 1, Parent = openBtn })
+		W._openScale = scale
+		local moved, dStart, pStart = false, nil, nil
+		OnDrag(openBtn, function(input)
+			moved = false
+			dStart, pStart = input.Position, openBtn.Position
+			Spring(scale, { Scale = 0.94 }, 6, 1)
+		end, function(input)
+			if o.Draggable == false then return end
+			local d = input.Position - dStart
+			if math.abs(d.X) + math.abs(d.Y) > 6 then moved = true end
+			if moved then
+				Spring(openBtn, {
+					Position = UDim2.new(pStart.X.Scale, pStart.X.Offset + d.X, pStart.Y.Scale, pStart.Y.Offset + d.Y),
+				}, 9, 1)
+			end
+		end, function()
+			Spring(scale, { Scale = 1 }, 4, 0.45)
+			if not moved then W:Open() end
+		end)
+	end
+	local function ShouldShowOpenButton()
+		if openCfg.Enabled == false then return false end
+		if openCfg.OnlyMobile ~= false and not IsTouch() then return false end
+		return true
+	end
+	BuildOpenButton()
+
+	------------------------------------------------------------------
+	-- 窗口方法
+	------------------------------------------------------------------
+	local hintShown = false
+	local animToken = 0
+
+	-- 悬浮按钮中心相对窗口中心的偏移 (窗口本地坐标); 最小化时窗口缩进按钮, 打开时从按钮弹出
+	local function BubbleOffset()
+		if not (openBtn and openBtn.Visible) then return nil end
+		local gs = openGui.AbsoluteSize
+		-- 图层刚创建时可能还没算出尺寸, 退回用视口尺寸 (悬浮按钮图层本就覆盖整个视口)
+		if gs.X <= 0 and workspace.CurrentCamera then gs = workspace.CurrentCamera.ViewportSize end
+		local rs = root.AbsoluteSize
+		if gs.X <= 0 or rs.X <= 0 then return nil end
+		local p = openBtn.Position
+		local inset = GetInset()
+		-- 悬浮按钮图层覆盖顶栏, 主界面不覆盖, 换算到主界面坐标
+		local bx = gs.X * p.X.Scale + p.X.Offset - inset.X
+		local by = gs.Y * p.Y.Scale + p.Y.Offset + 22 - inset.Y
+		local rp = root.AbsolutePosition
+		local s = math.max(userScale.Scale, 0.01)
+		return (bx - (rp.X + rs.X / 2)) / s, (by - (rp.Y + rs.Y / 2)) / s
+	end
+
+	-- 动画只用 UIScale 缩放 + 位移, 不做整体透明度渐变 (那需要 CanvasGroup, 代价高)
+	function W:Open()
+		if W.Destroyed then return end
+		animToken = animToken + 1
+		if W.Closed then
+			local dx, dy = BubbleOffset()
+			if dx then Set(scaler, { Position = UDim2.new(0.5, dx, 0.5, dy) }) end
+		end
+		W.Closed = false
+		root.Visible = true
+		-- 内容等外壳展开到 85% 再显示 (见 _Step)
+		if not canvas.Visible then W._reveal = true end
+		Spring(animScale, { Scale = 1 }, 3, 0.7)
+		Spring(scaler, { Position = UDim2.new(0.5, 0, 0.5, 0) }, 3, 0.85)
+		Restyle(shadow, 4)
+		if openBtn then openBtn.Visible = false end
+		for _, fn in ipairs(W._open) do task.spawn(SafeCall, fn) end
+	end
+
+	function W:Close()
+		if W.Destroyed or W.Closed then return end
+		W.Closed = true
+		animToken = animToken + 1
+		local my = animToken
+		-- 先藏起内容, 只让空的玻璃外壳缩进悬浮按钮
+		W._reveal = false
+		canvas.Visible = false
+		local bubble = ShouldShowOpenButton() and openBtn
+		if bubble then
+			openBtn.Visible = true
+			Set(W._openScale, { Scale = 0.5 })
+			Spring(W._openScale, { Scale = 1 }, 3.4, 0.55)
+		end
+		local dx, dy = BubbleOffset()
+		Spring(animScale, { Scale = 0 }, 4.2, 1)
+		if dx then Spring(scaler, { Position = UDim2.new(0.5, dx, 0.5, dy) }, 4.2, 1) end
+		Restyle(shadow, 6)
+		task.delay(0.3, function()
+			if my == animToken and W.Closed and not W.Destroyed then root.Visible = false end
+		end)
+		if not bubble and not hintShown and W.ToggleKey then
+			hintShown = true
+			WindUI:Notify({
+				Title = WindUI.Strings.Hidden,
+				Content = string.format(WindUI.Strings.Reopen, W.ToggleKey.Name),
+				Duration = 3,
+			})
+		end
+		for _, fn in ipairs(W._close) do task.spawn(SafeCall, fn) end
+		return W
+	end
+	W.Minimize = W.Close
+
+	function W:Toggle()
+		if W.Closed then W:Open() else W:Close() end
+	end
+
+	function W:Destroy()
+		if W.Destroyed then return end
+		for _, fn in ipairs(W._destroy) do SafeCall(fn) end
+		W.Destroyed = true
+		W:_SetAcrylic(false)
+		W._reveal = false
+		canvas.Visible = false
+		Spring(animScale, { Scale = 0 }, 4.2, 1)
+		task.delay(0.3, function()
+			gui:Destroy()
+			openGui:Destroy()
+		end)
+		for _, c in ipairs(W._conns) do pcall(function() c:Disconnect() end) end
+		local i = Find(WindUI.Windows, W)
+		if i then table.remove(WindUI.Windows, i) end
+		if WindUI.Window == W then WindUI.Window = WindUI.Windows[#WindUI.Windows] end
+	end
+
+	function W:OnOpen(fn) table.insert(W._open, fn) end
+	function W:OnClose(fn) table.insert(W._close, fn) end
+	function W:OnDestroy(fn) table.insert(W._destroy, fn) end
+
+	function W:SetToggleKey(key)
+		W.ToggleKey = WindUI.ParseKey(key)
+	end
+
+	function W:SetTitle(t)
+		W.Title = t
+		titleLabel.Text = t or ""
+	end
+
+	function W:SetAuthor(a)
+		W.Author = a
+		authorLabel.Text = a or ""
+		authorLabel.Visible = a ~= nil and a ~= ""
+	end
+
+	function W:SetIcon(icon)
+		if windowIcon then windowIcon.Image = GetIcon(icon) or "" end
+	end
+
+	function W:SetSize(s)
+		Spring(root, { Size = s }, 3.5, 0.85)
+		W.Size = s
+	end
+
+	function W:SetBackgroundImage(img)
+		bgImage.Image = img and (GetIcon(img) or tostring(img)) or ""
+		bgImage.Visible = img ~= nil and img ~= ""
+	end
+
+	function W:SetBackgroundImageTransparency(t)
+		bgImage.ImageTransparency = t
+	end
+
+	function W:SetBackgroundTransparency(t)
+		WindUI:SetTransparency(t)
+	end
+
+	function W:ToggleTransparency(on)
+		WindUI:SetTransparency(on and 0.72 or 0.5)
+	end
+
+	function W:GetUIScale() return userScale.Scale end
+
+	function W:SetUIScale(s)
+		s = math.clamp(tonumber(s) or 1, 0.3, 2)
+		Spring(userScale, { Scale = s }, 3.5, 0.9)
+	end
+
+	function W:SetToTheCenter()
+		local s = userScale.Scale
+		local sz = root.AbsoluteSize
+		local target = UDim2.new(0.5, -sz.X / 2, 0.5, -sz.Y / 2)
+		if sz.X <= 0 then target = UDim2.new(0.5, -root.Size.X.Offset * s / 2, 0.5, -root.Size.Y.Offset * s / 2) end
+		Spring(root, { Position = target }, 3.5, 0.85)
+		W.Position = target
+	end
+
+	local restoreSize, restorePos
+	function W:ToggleFullscreen()
+		if not W.IsFullscreen then
+			restoreSize, restorePos = root.Size, root.Position
+			local vp = gui.AbsoluteSize
+			local s = userScale.Scale
+			W.IsFullscreen = true
+			W.Maximized = true
+			Spring(root, {
+				Position = UDim2.new(0, 8, 0, 8),
+				Size = UDim2.fromOffset((vp.X - 16) / s, (vp.Y - 16) / s),
+			}, 3.2, 0.82)
+		else
+			W.IsFullscreen = false
+			W.Maximized = false
+			Spring(root, { Position = restorePos, Size = restoreSize }, 3.2, 0.82)
+		end
+	end
+
+	function W:IsResizable(v)
+		W.Resizable = v and true or false
+		grip.Visible = W.Resizable
+	end
+
+	function W:LockAll()
+		for _, E in ipairs(W.AllElements) do if E.Lock then E:Lock() end end
+	end
+	function W:UnlockAll()
+		for _, E in ipairs(W.AllElements) do if E.Unlock then E:Unlock() end end
+	end
+	function W:GetLocked()
+		local t = {}
+		for _, E in ipairs(W.AllElements) do if E.Locked then table.insert(t, E) end end
+		return t
+	end
+	function W:GetUnlocked()
+		local t = {}
+		for _, E in ipairs(W.AllElements) do if not E.Locked then table.insert(t, E) end end
+		return t
+	end
+
+	function W:DisableTopbarButtons(list)
+		for _, name in ipairs(list or {}) do
+			local b = W.TopbarButtons[name]
+			if b then b.Visible = false end
+		end
+	end
+
+	function W:CreateTopbarButton(name, icon, callback, order)
+		return TopButton(customButtons, name or "Custom", icon, order or 0, callback, false, false)
+	end
+
+	function W:EditOpenButton(o)
+		for k, v in pairs(o or {}) do openCfg[k] = v end
+		local wasVisible = openBtn and openBtn.Visible
+		BuildOpenButton()
+		openBtn.Visible = wasVisible or false
+	end
+
+	function W:Tag(t)
+		t = t or {}
+		local col = ResolveColor(t.Color)
+		local function c(th) return col or th.Accent end
+		local tag = Create("Frame", {
+			Name = "Tag",
+			Size = UDim2.new(0, 0, 0, 22),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundTransparency = 0.82,
+			ZIndex = 5,
+			Theme = { BackgroundColor3 = c },
+			Parent = tagHolder,
+		})
+		Create("UICorner", { CornerRadius = t.Radius and UDim.new(0, t.Radius) or UDim.new(1, 0), Parent = tag })
+		Create("UIStroke", { Transparency = 0.55, Theme = { Color = c }, Parent = tag })
+		Padding(0, 0, 8, 9, tag)
+		List(tag, 4, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+		local icon
+		if t.Icon and GetIcon(t.Icon) then
+			icon = IconImage(t.Icon, 12, { LayoutOrder = 1, ZIndex = 5, Theme = { ImageColor3 = c }, Parent = tag })
+		end
+		local label = Text({
+			Text = t.Title or "Tag", Font = "SemiBold", TextSize = 12, LayoutOrder = 2, ZIndex = 5,
+			Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Theme = { TextColor3 = c }, Parent = tag,
+		})
+		local T = {}
+		function T:SetTitle(s) label.Text = s or "" end
+		function T:SetColor(newColor)
+			col = ResolveColor(newColor)
+			Restyle(tag, 5)
+			Restyle(label, 5)
+			if icon then Restyle(icon, 5) end
+		end
+		function T:Destroy() tag:Destroy() end
+		return T
+	end
+
+	function W:Dialog(d)
+		return ShowDialog(canvas, d or {}, 60, R)
+	end
+
+	function W:Notify(n)
+		return WindUI:Notify(n)
+	end
+
+	function W:Divider()
+		local holder = Create("Frame", {
+			Name = "Divider",
+			Size = UDim2.new(1, 0, 0, 9),
+			BackgroundTransparency = 1,
+			LayoutOrder = NextSideOrder(),
+			Parent = tabHolder,
+		})
+		Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 0),
+			Size = UDim2.new(1, -16, 0, 1),
+			BorderSizePixel = 0,
+			BackgroundTransparency = 0.85,
+			Theme = { BackgroundColor3 = "Text" },
+			Parent = holder,
+		})
+		return { Destroy = function() holder:Destroy() end }
+	end
+
+	-- 侧边栏分组 (Window:Section)
+	function W:Section(s)
+		s = type(s) == "string" and { Title = s } or s or {}
+		local order = NextSideOrder()
+		local group = Create("Frame", {
+			Name = "SidebarSection",
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = order,
+			ZIndex = 4,
+			Parent = tabHolder,
+		})
+		List(group, 4)
+		local head = Create("TextButton", {
+			Name = "Header",
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 26),
+			LayoutOrder = 1,
+			ZIndex = 4,
+			Parent = group,
+		})
+		local chev = IconImage("chevron-down", 14, {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0), ZIndex = 4,
+			Theme = { ImageColor3 = "Placeholder" }, Parent = head,
+		})
+		local hOff = 8
+		if s.Icon and GetIcon(s.Icon) then
+			IconImage(s.Icon, 14, {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0), ZIndex = 4,
+				Theme = { ImageColor3 = "Placeholder" }, Parent = head,
+			})
+			hOff = 28
+		end
+		local headLabel = Text({
+			Text = s.Title or "", Font = "SemiBold", TextSize = 12, ZIndex = 4,
+			Position = UDim2.new(0, hOff, 0, 0), Size = UDim2.new(1, -(hOff + 26), 1, 0),
+			TextTruncate = Enum.TextTruncate.AtEnd, Theme = { TextColor3 = "Placeholder" }, Parent = head,
+		})
+		local container = Create("Frame", {
+			Name = "Tabs",
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = 2,
+			ZIndex = 4,
+			Parent = group,
+		})
+		List(container, 4)
+		local SS = { Opened = s.Opened ~= false, Tabs = {} }
+		local function apply()
+			container.Visible = SS.Opened
+			Spring(chev, { Rotation = SS.Opened and 0 or -90 }, 4.5, 0.65)
+			task.defer(function() W:_MoveIndicator(false) end)
+		end
+		head.MouseButton1Click:Connect(function()
+			SS.Opened = not SS.Opened
+			apply()
+		end)
+		function SS:Tab(c) local t = W:Tab(c, nil, container) table.insert(SS.Tabs, t) return t end
+		function SS:Open() SS.Opened = true apply() end
+		function SS:Close() SS.Opened = false apply() end
+		function SS:SetTitle(t) headLabel.Text = t or "" end
+		function SS:Destroy() group:Destroy() end
+		container.Visible = SS.Opened
+		chev.Rotation = SS.Opened and 0 or -90
+		return SS
+	end
+
+	------------------------------------------------------------------
+	-- Tab
+	------------------------------------------------------------------
+	function W:Tab(a, b, parentContainer)
+		local tcfg = NormalizeArgs(a, b)
+		local index = #W.Tabs + 1
+		local tab = NewHost(W, nil, nil, {
+			__type = "Tab",
+			Title = tcfg.Title or ("Tab " .. index),
+			Icon = tcfg.Icon,
+			Desc = tcfg.Desc,
+			Index = index,
+			Locked = false,
+			Selected = false,
+			Elements = {},
+			SubTabs = {},
+			UIElements = {},
+			_PageY = 0,
+		})
+		setmetatable(tab, TabMT)
+		local st = { Hover = false }
+
+		local btn = Create("Frame", {
+			Name = "Tab",
+			Size = UDim2.new(1, 0, 0, 36),
+			BackgroundTransparency = 1,
+			LayoutOrder = NextSideOrder(),
+			ZIndex = 4,
+			Parent = parentContainer or tabHolder,
+		})
+		local hover = Create("Frame", {
+			Name = "Hover",
+			Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 4,
+			Theme = {
+				BackgroundColor3 = "Element",
+				BackgroundTransparency = function(t)
+					if st.Hover and not tab.Selected then return t.Dark and 0.94 or 0.6 end
+					return 1
+				end,
+			},
+			Parent = btn,
+		})
+		Corner(10, hover)
+		local tOff = 14
+		local icon
+		if tcfg.Icon and GetIcon(tcfg.Icon) then
+			icon = IconImage(tcfg.Icon, 17, {
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.new(0, 14, 0.5, 0),
+				ZIndex = 5,
+				Theme = { ImageColor3 = function(t)
+					if not IsLucide(tcfg.Icon) then return WHITE end
+					if not tab.Selected then return t.SubText end
+					return t.Dark and Mix(t.Accent, WHITE, 0.35) or t.Accent
+				end },
+				Parent = btn,
+			})
+			tOff = 40
+		end
+		local label = Text({
+			Name = "Title",
+			Text = tab.Title,
+			TextSize = 14,
+			Position = UDim2.new(0, tOff, 0, 0),
+			Size = UDim2.new(1, -(tOff + 8), 1, 0),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			ZIndex = 5,
+			Theme = {
+				TextColor3 = function(t) return tab.Selected and t.Text or t.SubText end,
+				TextTransparency = function() return tab.Locked and 0.5 or 0 end,
+			},
+			Parent = btn,
+		})
+		local click = Create("TextButton", {
+			Name = "Click",
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 6,
+			Parent = btn,
+		})
+		click.MouseEnter:Connect(function() st.Hover = true Restyle(hover, 6) end)
+		click.MouseLeave:Connect(function() st.Hover = false Restyle(hover, 4) end)
+		click.MouseButton1Click:Connect(function() W:SelectTab(tab) end)
+
+		local function restyleButton()
+			Restyle(hover, 5)
+			Restyle(label, 5)
+			if icon then Restyle(icon, 5) end
+		end
+		tab._Restyle = restyleButton
+
+		-- 内容页 (含 meyyUI 风格的固定子标签栏)
+		local tabFrame = Create("Frame", {
+			Name = "TabPage",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			Visible = false,
+			ZIndex = 3,
+			Parent = pages,
+		})
+		local subBar = Create("ScrollingFrame", {
+			Name = "SubTabBar",
+			Size = UDim2.new(1, -8, 0, SUBBAR - 6),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 0,
+			CanvasSize = UDim2.new(0, 0, 0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.X,
+			Visible = false,
+			ZIndex = 30,
+			Parent = tabFrame,
+		})
+		List(subBar, 6, true, { VerticalAlignment = Enum.VerticalAlignment.Center })
+		Padding(0, 0, 2, 2, subBar)
+		local page = Create("ScrollingFrame", {
+			Name = "Page",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageTransparency = 0.45,
+			CanvasSize = UDim2.new(0, 0, 0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ZIndex = 3,
+			Theme = { ScrollBarImageColor3 = "Accent" },
+			Parent = tabFrame,
+		})
+		Padding(4, 16, 2, 10, page)
+		List(page, 8)
+
+		tab.Frame = btn
+		tab.Container = page
+		tab.UIElements.Main = btn
+		tab.UIElements.Page = page
+		tab.UIElements.Container = tabFrame
+		tab.UIElements.SubTabBar = subBar
+		tab._SubBar = subBar
+		table.insert(W.Tabs, tab)
+
+		if tcfg.Locked then tab:Lock() end
+		if index == 1 then W:SelectTab(tab) end
+		return tab
+	end
+	W.AddTab = W.Tab
+	W.CreateTab = W.Tab
+
+	function W:SelectTab(t)
+		local tab = type(t) == "number" and W.Tabs[t] or t
+		if type(tab) ~= "table" or tab.Locked then return end
+		local same = W.SelectedTab == tab
+		W.SelectedTab = tab
+		W.CurrentTab = tab.Index
+		for _, other in ipairs(W.Tabs) do
+			other.Selected = other == tab
+			other.UIElements.Container.Visible = other == tab
+			other._Restyle()
+		end
+		if not same then
+			local page = tab.UIElements.Page
+			Set(page, { Position = UDim2.new(0, 0, 0, tab._PageY + 22) })
+			Spring(page, { Position = UDim2.new(0, 0, 0, tab._PageY) }, 3, 0.72)
+			pageTitle.Text = tab.Title
+			Set(pageTitle, { TextTransparency = 1, Position = UDim2.new(0, 14, 0, 0) })
+			Spring(pageTitle, { TextTransparency = 0 }, 3, 1)
+			Spring(pageTitle, { Position = UDim2.new(0, 4, 0, 0) }, 3, 0.8)
+			if W._hasSelected then Sweep() end
+		end
+		W._hasSelected = true
+		W:_MoveIndicator(false)
+		if W._onTab then task.spawn(SafeCall, W._onTab, tab.Index) end
+	end
+
+	function W:OnTabChange(fn) W._onTab = fn end
+	W.OnChange = W.OnTabChange
+
+	function W:_SetPageTitle(tab)
+		if W.SelectedTab == tab then pageTitle.Text = tab.Title end
+	end
+
+	-- 搜索: 过滤标签 + 当前标签下的元素
+	function W:_Search(q)
+		q = (q or ""):lower()
+		for _, tab in ipairs(W.Tabs) do
+			local titleHit = q == "" or tab.Title:lower():find(q, 1, true) ~= nil
+			local anyHit = false
+			for _, E in ipairs(tab.Elements) do
+				local hit = q == ""
+					or tostring(E.Title or ""):lower():find(q, 1, true) ~= nil
+					or tostring(E.Desc or ""):lower():find(q, 1, true) ~= nil
+				if hit then anyHit = true end
+				E._SearchHit = hit
+			end
+			for _, E in ipairs(tab.Elements) do
+				local show = E._SearchHit or (titleHit and not anyHit)
+				E.ElementFrame.Visible = show and E.Visible ~= false
+			end
+			tab.Frame.Visible = titleHit or anyHit
+		end
+		task.defer(function() W:_MoveIndicator(false) end)
+	end
+	if searchBox then
+		searchBox:GetPropertyChangedSignal("Text"):Connect(function() W:_Search(searchBox.Text) end)
+	end
+
+	------------------------------------------------------------------
+	-- 背景模糊
+	------------------------------------------------------------------
+	function W:_SetAcrylic(on)
+		if on and not W._blurPart and not W.Destroyed then
+			local ok = pcall(function()
+				local part, mesh = Acrylic.New()
+				part.Parent = workspace.CurrentCamera or workspace
+				W._blurPart, W._blurMesh = part, mesh
+			end)
+			if ok then
+				Acrylic.Users = Acrylic.Users + 1
+				pcall(Acrylic.EnableDOF)
+			end
+		elseif not on and W._blurPart then
+			pcall(function() W._blurPart:Destroy() end)
+			W._blurPart, W._blurMesh = nil, nil
+			Acrylic.Users = math.max(Acrylic.Users - 1, 0)
+			if Acrylic.Users == 0 then pcall(Acrylic.DisableDOF) end
+		end
+	end
+
+	------------------------------------------------------------------
+	-- 每帧: 内容显现 / 高光跟随鼠标 / 模糊跟随
+	------------------------------------------------------------------
+	function W:_Step(dt)
+		if W.Destroyed then return end
+		local visible = root.Visible and not W.Closed
+		if visible then
+			-- 外壳快展开完时显示内容, 再做一个只平移的小入场 (平移不触发文字重排)
+			if W._reveal and animScale.Scale >= 0.85 then
+				W._reveal = false
+				Set(canvas, { Position = UDim2.new(0, 0, 0, 8) })
+				canvas.Visible = true
+				Spring(canvas, { Position = UDim2.new(0, 0, 0, 0) }, 4, 0.8)
+			end
+		end
+		if W._blurPart then
+			W._blurPart.Transparency = visible and 0.98 or 1
+			if visible then pcall(Acrylic.Update, W._blurPart, W._blurMesh, shell) end
+		end
+		if openBtn and openBtn.Visible and W._openStrokeGrad then
+			W._openStrokeGrad.Rotation = (W._openStrokeGrad.Rotation + dt * 90) % 360
+		end
+	end
+
+	------------------------------------------------------------------
+	-- 顶栏按钮
+	------------------------------------------------------------------
+	local closeFn = function()
+		W:Dialog({
+			Title = WindUI.Strings.CloseTitle,
+			Content = WindUI.Strings.CloseContent,
+			Icon = "alert-triangle",
+			Buttons = {
+				{ Title = WindUI.Strings.Cancel, Variant = "Secondary" },
+				{ Title = WindUI.Strings.Close, Variant = "Primary", Callback = function() W:Destroy() end },
+			},
+		})
+	end
+	if mac then
+		TopButton(buttons, "Close", "x", 1, closeFn, true, true)
+		TopButton(buttons, "Minimize", "minus", 2, function() W:Close() end, false, true)
+		TopButton(buttons, "Fullscreen", "maximize-2", 3, function() W:ToggleFullscreen() end, false, true)
+	else
+		TopButton(buttons, "Minimize", "minus", 1, function() W:Close() end)
+		TopButton(buttons, "Fullscreen", "maximize-2", 2, function() W:ToggleFullscreen() end)
+		TopButton(buttons, "Close", "x", 3, closeFn, true)
+	end
+
+	table.insert(W._conns, Connect(UserInputService.InputBegan, function(input)
+		if W.Destroyed or not W.ToggleKey then return end
+		if UserInputService:GetFocusedTextBox() then return end
+		if input.KeyCode == W.ToggleKey then W:Toggle() end
+	end))
+
+	W.ConfigManager = WindUI._NewConfigManager(W)
+
+	-- 小屏自适应缩放 + 居中
+	task.defer(function()
+		local vp = gui.AbsoluteSize
+		if (vp.X <= 0 or vp.Y <= 0) and workspace.CurrentCamera then vp = workspace.CurrentCamera.ViewportSize end
+		local w, h = size.X.Offset, size.Y.Offset
+		if cfg.AutoScale ~= false and vp.X > 0 and w > 0 then
+			local s = math.min(1, (vp.X - 24) / w, (vp.Y - 24) / h)
+			userScale.Scale = math.max(s, 0.45)
+		end
+		local s = userScale.Scale
+		root.Position = UDim2.new(0.5, -w * s / 2, 0.5, -h * s / 2)
+		W.Position = root.Position
+	end)
+
+	if WindUI.Acrylic then W:_SetAcrylic(true) end
+	ApplyTheme(true)
+	W:Open()
+	task.delay(1.5, function()
+		if not W.Destroyed and W.ConfigManager then pcall(function() W.ConfigManager:LoadAutoLoad() end) end
+	end)
+	return W
+end
+
+function WindUI:ToggleAcrylic(on)
+	self.Acrylic = on and true or false
+	for _, W in ipairs(self.Windows) do W:_SetAcrylic(self.Acrylic) end
+	ApplyTheme(false)
+end
+
+function WindUI:Destroy()
+	for i = #self.Windows, 1, -1 do self.Windows[i]:Destroy() end
+	for _, c in ipairs(self.Connections) do pcall(function() c:Disconnect() end) end
+	if Overlay then Overlay:Destroy() end
+	self.Unloaded = true
+end
+
+--------------------------------------------------------------------------
+-- Tab 方法 + SubTab (meyyUI 效果)
+--------------------------------------------------------------------------
+function TabMethods:Select()
+	self.Window:SelectTab(self)
+end
+
+function TabMethods:SetTitle(t)
+	self.Title = t or ""
+	local label = self.Frame:FindFirstChild("Title")
+	if label then label.Text = self.Title end
+	self.Window:_SetPageTitle(self)
+end
+
+function TabMethods:SetIcon(icon)
+	local img = self.Frame:FindFirstChild("Icon")
+	if img then img.Image = GetIcon(icon) or "" end
+end
+
+function TabMethods:Lock()
+	self.Locked = true
+	self._Restyle()
+end
+
+function TabMethods:Unlock()
+	self.Locked = false
+	self._Restyle()
+end
+
+function TabMethods:ScrollToTop()
+	Spring(self.UIElements.Page, { CanvasPosition = Vector2.new(0, 0) }, 3, 1)
+end
+
+-- 子标签栏固定在内容区顶部 (不随页面滚动); 添加第一个子标签时页面整体下移让位;
+-- 所有子页面共用一个容器叠放在页面最上方, 只显示当前选中的那个
+function TabMethods:SubTab(a, b)
+	local cfg = NormalizeArgs(a, b)
+	local tab = self
+	local W = tab.Window
+	local page = tab.UIElements.Page
+	if #tab.SubTabs == 0 then
+		tab._PageY = SUBBAR
+		tab._SubBar.Visible = true
+		Set(page, { Position = UDim2.new(0, 0, 0, SUBBAR), Size = UDim2.new(1, 0, 1, -SUBBAR) })
+		tab._SubHolder = Create("Frame", {
+			Name = "SubPagesHolder",
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = -50,
+			Parent = page,
+		})
+		List(tab._SubHolder, 0)
+	end
+
+	local index = #tab.SubTabs + 1
+	local subPage = Create("Frame", {
+		Name = "SubPage",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = index == 1,
+		LayoutOrder = index,
+		Parent = tab._SubHolder,
+	})
+	List(subPage, 8)
+
+	local sub = NewHost(W, tab, subPage, {
+		__type = "SubTab",
+		Title = cfg.Title or "Tab",
+		Index = index,
+		Selected = index == 1,
+		Page = subPage,
+	})
+
+	local btn = Create("TextButton", {
+		Name = "SubTab",
+		Text = "",
+		AutoButtonColor = false,
+		Size = UDim2.new(0, cfg.Width or 96, 1, -4),
+		LayoutOrder = index,
+		ZIndex = 30,
+		Theme = {
+			BackgroundColor3 = function(t) return sub.Selected and t.Accent or t.Element end,
+			BackgroundTransparency = function(t)
+				if sub.Selected then return 0.15 end
+				return t.ElementT
+			end,
+		},
+		Parent = tab._SubBar,
+	})
+	Corner(8, btn)
+	Rim(btn, "ElementStrokeT", 1.2)
+	local tOff = 0
+	if cfg.Icon and GetIcon(cfg.Icon) then
+		IconImage(cfg.Icon, 14, {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), ZIndex = 31,
+			Theme = { ImageColor3 = function(t) return sub.Selected and t.OnAccent or t.Text end },
+			Parent = btn,
+		})
+		tOff = 18
+	end
+	local label = Text({
+		Name = "Title",
+		Text = sub.Title,
+		Font = "Bold",
+		TextSize = 12,
+		Position = UDim2.new(0, 4 + tOff, 0, 0),
+		Size = UDim2.new(1, -(8 + tOff), 1, 0),
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 31,
+		Theme = { TextColor3 = function(t) return sub.Selected and t.OnAccent or t.Text end },
+		Parent = btn,
+	})
+	-- 注意: 不能用 sub.Button 作字段名, 会盖住 HostMethods.Button (控件方法)
+	sub.UIElements = { Button = btn, Page = subPage }
+
+	local function restyle(s)
+		Restyle(s.UIElements.Button, 3.5)
+		for _, d in ipairs(s.UIElements.Button:GetDescendants()) do
+			if Bindings[d] then Restyle(d, 3.5) end
+		end
+	end
+
+	function sub:Select()
+		for _, s in ipairs(tab.SubTabs) do
+			s.Selected = s == sub
+			s.Page.Visible = s == sub
+			restyle(s)
+		end
+		tab.SelectedSubTab = sub
+	end
+
+	function sub:SetTitle(t)
+		sub.Title = t or ""
+		label.Text = sub.Title
+	end
+
+	function sub:Destroy()
+		btn:Destroy()
+		subPage:Destroy()
+		local i = Find(tab.SubTabs, sub)
+		if i then table.remove(tab.SubTabs, i) end
+	end
+
+	btn.MouseButton1Click:Connect(function() sub:Select() end)
+	PressScale(btn)
+	table.insert(tab.SubTabs, sub)
+	if index == 1 then tab.SelectedSubTab = sub end
+	return sub
+end
+TabMethods.AddSubTab = TabMethods.SubTab
+TabMethods.CreateSubTab = TabMethods.SubTab
+
+function TabMethods:SelectSubTab(i)
+	local s = type(i) == "number" and self.SubTabs[i] or i
+	if s then s:Select() end
+end
+
+--------------------------------------------------------------------------
+-- 配置系统 (Window.ConfigManager)
+--------------------------------------------------------------------------
+local function Sanitize(name)
+	return (tostring(name):gsub("[^%w%-_ ]", "_"))
+end
+
+local function Serialize(E)
+	local t = E.__type
+	if t == "Toggle" or t == "Input" or t == "Keybind" then
+		return { __type = t, value = E.Value }
+	elseif t == "Slider" then
+		return { __type = t, value = E.Value.Default }
+	elseif t == "Dropdown" then
+		local v = E.Value
+		if E.Multi then
+			local out = {}
+			for _, x in ipairs(v) do table.insert(out, ItemKey(x)) end
+			v = out
+		elseif v ~= nil then
+			v = ItemKey(v)
+		end
+		return { __type = t, value = v }
+	elseif t == "Colorpicker" then
+		return { __type = t, value = ColorToHex(E.Value), transparency = E.Transparency }
+	end
+	return nil
+end
+
+local function Apply(E, entry)
+	local t = E.__type
+	if t == "Colorpicker" then
+		local ok, c = pcall(Color3.fromHex, entry.value)
+		if ok and c then E:Update(c, entry.transparency) end
+	elseif t == "Dropdown" then
+		E:Select(entry.value)
+	elseif E.Set then
+		E:Set(entry.value)
+	end
+end
+
+function WindUI._NewConfigManager(W)
+	local CM = { Window = W, Configs = {} }
+	CM.Path = "WindUI/" .. Sanitize(W.Folder) .. "/config"
+	pcall(function()
+		if not isfolder("WindUI") then makefolder("WindUI") end
+		if not isfolder("WindUI/" .. Sanitize(W.Folder)) then makefolder("WindUI/" .. Sanitize(W.Folder)) end
+		if not isfolder(CM.Path) then makefolder(CM.Path) end
+	end)
+
+	function CM:CreateConfig(name)
+		name = Sanitize(name or "default")
+		if CM.Configs[name] then return CM.Configs[name] end
+		local C = { Name = name, Elements = {} }
+		local file = CM.Path .. "/" .. name .. ".json"
+		function C:Register(flag, element) C.Elements[flag] = element end
+		function C:GetData()
+			local data = {}
+			for flag, E in pairs(W.Flags) do data[flag] = Serialize(E) end
+			for flag, E in pairs(C.Elements) do data[flag] = Serialize(E) end
+			return { __version = 1, __elements = data }
+		end
+		function C:Save()
+			local ok = pcall(function() writefile(file, HttpService:JSONEncode(C:GetData())) end)
+			return ok
+		end
+		function C:Load()
+			local ok, data = pcall(function() return HttpService:JSONDecode(readfile(file)) end)
+			if not ok or type(data) ~= "table" then return false end
+			for flag, entry in pairs(data.__elements or {}) do
+				local E = C.Elements[flag] or W.Flags[flag]
+				if E and type(entry) == "table" then pcall(Apply, E, entry) end
+			end
+			return true
+		end
+		function C:Delete()
+			CM.Configs[name] = nil
+			return pcall(function() delfile(file) end)
+		end
+		function C:SetAsCurrent() W.CurrentConfig = C end
+		function C:SetAutoLoad(v)
+			pcall(function() writefile(CM.Path .. "/autoload.txt", v and name or "") end)
+		end
+		CM.Configs[name] = C
+		return C
+	end
+	CM.Config = CM.CreateConfig
+
+	function CM:GetConfig(name) return CM.Configs[Sanitize(name)] end
+
+	function CM:AllConfigs()
+		local out = {}
+		pcall(function()
+			for _, f in ipairs(listfiles(CM.Path)) do
+				local n = tostring(f):match("([^/\\]+)%.json$")
+				if n then table.insert(out, n) end
+			end
+		end)
+		table.sort(out)
+		return out
+	end
+
+	function CM:DeleteConfig(name)
+		return CM:CreateConfig(name):Delete()
+	end
+
+	function CM:GetAutoLoad()
+		local ok, n = pcall(function() return readfile(CM.Path .. "/autoload.txt") end)
+		if ok and type(n) == "string" and n ~= "" then return n end
+		return nil
+	end
+
+	function CM:LoadAutoLoad()
+		local n = CM:GetAutoLoad()
+		if n then return CM:CreateConfig(n):Load() end
+		return false
+	end
+
+	return CM
+end
+
+function WindowMethods:SetCurrentConfig(C)
+	self.CurrentConfig = C
+end
+
+--------------------------------------------------------------------------
+-- 内置设置页: 主题 / 透明度 / 模糊 / 缩放 / 快捷键 / 配置管理
+--------------------------------------------------------------------------
+function WindowMethods:CreateSettingsTab(opts)
+	opts = opts or {}
+	local W = self
+	local CM = W.ConfigManager
+	local tab = W:Tab({ Title = opts.Title or "设置", Icon = opts.Icon or "settings" })
+
+	local look = tab:Section({ Title = "外观", Icon = "palette" })
+	look:Dropdown({
+		Title = "主题配色",
+		Desc = "共 " .. #WindUI.ThemeOrder .. " 套, 切换时平滑过渡",
+		Values = WindUI.ThemeOrder,
+		Value = WindUI.CurrentThemeName,
+		SearchBarEnabled = true,
+		Callback = function(v) WindUI:SetTheme(v) end,
+	})
+	look:Slider({
+		Title = "玻璃透明度",
+		Value = { Min = 0, Max = 100, Default = math.floor(WindUI.Transparency * 100 + 0.5) },
+		Step = 1,
+		Callback = function(v) WindUI:SetTransparency(v / 100) end,
+	})
+	look:Toggle({
+		Title = "背景模糊 (Acrylic)",
+		Desc = "真实模糊游戏画面, 需要画质 ≥ 8",
+		Value = WindUI.Acrylic,
+		Callback = function(v) WindUI:ToggleAcrylic(v) end,
+	})
+	look:Slider({
+		Title = "界面缩放 (%)",
+		Value = { Min = 50, Max = 150, Default = math.floor(W:GetUIScale() * 100 + 0.5) },
+		Step = 5,
+		Callback = function(v) W:SetUIScale(v / 100) end,
+	})
+	look:Keybind({
+		Title = "显示 / 隐藏快捷键",
+		Value = W.ToggleKey and W.ToggleKey.Name or "None",
+		ChangedCallback = function(k)
+			W:SetToggleKey(k)
+		end,
+	})
+
+	if CM then
+		local cfgSec = tab:Section({ Title = "配置", Icon = "folder" })
+		local nameInput = cfgSec:Input({ Title = "配置名", Placeholder = "default", InputIcon = "file" })
+		local list = cfgSec:Dropdown({ Title = "已保存的配置", Values = CM:AllConfigs(), AllowNone = true })
+		local function selected()
+			local n = nameInput.Value
+			if n == nil or n == "" then n = list.Value end
+			return n
+		end
+		local function refresh() list:Refresh(CM:AllConfigs()) end
+		local row1 = cfgSec:Group()
+		row1:Button({ Title = "保存", Icon = "save", Callback = function()
+			local n = selected()
+			if not n or n == "" then
+				WindUI:Notify({ Title = "配置", Content = "请先输入或选择配置名", Type = "Warning" })
+				return
+			end
+			local ok = CM:CreateConfig(n):Save()
+			refresh()
+			WindUI:Notify({ Title = "配置", Content = ok and ("已保存: " .. n) or "保存失败 (执行器不支持文件读写?)", Type = ok and "Success" or "Error" })
+		end })
+		row1:Button({ Title = "加载", Icon = "download", Callback = function()
+			local n = selected()
+			if not n or n == "" then return end
+			local ok = CM:CreateConfig(n):Load()
+			WindUI:Notify({ Title = "配置", Content = ok and ("已加载: " .. n) or "加载失败", Type = ok and "Success" or "Error" })
+		end })
+		local row2 = cfgSec:Group()
+		row2:Button({ Title = "删除", Icon = "trash-2", Callback = function()
+			local n = selected()
+			if not n or n == "" then return end
+			CM:DeleteConfig(n)
+			refresh()
+			WindUI:Notify({ Title = "配置", Content = "已删除: " .. n })
+		end })
+		row2:Button({ Title = "刷新列表", Icon = "refresh-cw", Callback = refresh })
+		cfgSec:Toggle({
+			Title = "自动加载",
+			Desc = "下次执行脚本时自动加载所选配置",
+			Value = CM:GetAutoLoad() ~= nil,
+			Callback = function(v)
+				local n = selected()
+				if n and n ~= "" then CM:CreateConfig(n):SetAutoLoad(v) end
+			end,
+		})
+	end
+	return tab
+end
+
+--------------------------------------------------------------------------
+-- 主循环
+--------------------------------------------------------------------------
+Connect(RunService.RenderStepped, function(dt)
+	StepSprings(dt)
+	local wins = WindUI.Windows
+	for i = #wins, 1, -1 do
+		local W = wins[i]
+		if W and W._Step then W:_Step(dt) end
+	end
+end)
+
+return WindUI
