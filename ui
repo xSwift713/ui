@@ -3165,7 +3165,7 @@ WindUI.Strings = {
 	Close = "Close",
 	Hidden = "界面已隐藏",
 	Reopen = "按 %s 重新打开",
-	Search = "搜索...",
+	Search = "Search",
 	Anonymous = "匿名用户",
 }
 
